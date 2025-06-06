@@ -3,7 +3,7 @@ FRAME is a decoder-only transformer model for predicting next-frame inputs in Su
 
 
 ## Features
-- Decoder-only architecture 
+- Decoder-only architecture (GPT-like)
 
 - Supports real-time inference on live frame sequences
 
