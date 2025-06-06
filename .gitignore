@@ -196,3 +196,4 @@ cython_debug/
 # etc.
 .idea/
 .DS_Store
+wandb/
