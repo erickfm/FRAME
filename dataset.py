@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 # ----------------------------------------------------------------------------
-# Helper generators ­– keep all column‑name logic in one place
+# Helper generators - keep all column‑name logic in one place
 # ----------------------------------------------------------------------------
 BTN = [
     "BUTTON_A", "BUTTON_B", "BUTTON_X", "BUTTON_Y",
