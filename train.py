@@ -12,8 +12,13 @@ from model import FramePredictor, ModelConfig
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Config
 # ─────────────────────────────────────────────────────────────────────────────
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
 
+# Training hyperparameters
 BATCH_SIZE      = 128
 NUM_EPOCHS      = 10
 LEARNING_RATE   = 3e-4
@@ -30,12 +35,11 @@ def collate_fn(batch):
     batch_state = {}
     batch_target = {}
 
-    state_keys = batch[0][0].keys()
-    for k in state_keys:
+    # stack input frames
+    for k in batch[0][0].keys():
         batch_state[k] = torch.stack([item[0][k] for item in batch], dim=0)
-
-    target_keys = batch[0][1].keys()
-    for k in target_keys:
+    # stack target frames
+    for k in batch[0][1].keys():
         batch_target[k] = torch.stack([item[1][k] for item in batch], dim=0)
 
     return batch_state, batch_target
@@ -53,11 +57,11 @@ def compute_loss(preds, targets):
     r_pred    = preds["R_val"].squeeze(-1)
     btn_pred  = preds["btn_logits"]
 
-    main_target = torch.stack([targets["main_x"], targets["main_y"]], dim=1)
-    c_target    = torch.stack([targets["c_x"], targets["c_y"]], dim=1)
+    main_target = torch.stack([targets["main_x"], targets["main_y"]], dim=-1)
+    c_target    = torch.stack([targets["c_x"], targets["c_y"]], dim=-1)
     l_target    = targets["l_shldr"]
     r_target    = targets["r_shldr"]
-    btn_target  = targets["btns"].float()
+    btn_target  = targets.get("btns", targets.get("btns_float")).float()
 
     loss_main = mse(main_pred, main_target)
     loss_c    = mse(c_pred, c_target)
@@ -75,14 +79,17 @@ def compute_loss(preds, targets):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Setup
+# 4. Data and model setup
 # ─────────────────────────────────────────────────────────────────────────────
-def get_dataloader():
-    dataset = MeleeFrameDatasetWithDelay(
+def get_dataset():
+    return MeleeFrameDatasetWithDelay(
         parquet_dir=DATA_DIR,
         sequence_length=SEQUENCE_LENGTH,
         reaction_delay=REACTION_DELAY,
     )
+
+
+def get_dataloader(dataset):
     return DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -92,51 +99,53 @@ def get_dataloader():
         drop_last=True,
     )
 
+
 def get_model():
-    cfg = ModelConfig(
-        max_seq_len=SEQUENCE_LENGTH,
-        num_stages=32,
-        num_ports=4,
-        num_characters=26,
-        num_actions=88,
-        num_costumes=6,
-        num_proj_types=160,
-        num_proj_subtypes=40,
-    )
-    return FramePredictor(cfg).to(DEVICE), cfg
+    # use canonical vocab sizes from cat_maps
+    cfg = ModelConfig(max_seq_len=SEQUENCE_LENGTH)
+    model = FramePredictor(cfg).to(DEVICE)
+    return model, cfg
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 def train():
-    dataloader = get_dataloader()
-    model, cfg = get_model()
+    dataset   = get_dataset()
+    dataloader= get_dataloader(dataset)
+    model, cfg= get_model()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    wandb.init(project="FRAME", entity="erickfm", config={
-        "batch_size": BATCH_SIZE,
-        "learning_rate": LEARNING_RATE,
-        "epochs": NUM_EPOCHS,
-        "sequence_length": SEQUENCE_LENGTH,
-        "reaction_delay": REACTION_DELAY,
-        "rollout_steps": ROLL_OUT_STEPS,
-        "model_dim": cfg.d_model,
-    })
+    # persist config in checkpoint and log to wandb
+    wandb.init(
+        project="FRAME",
+        entity="erickfm",
+        config={
+            # training
+            "batch_size": BATCH_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "epochs": NUM_EPOCHS,
+            "num_workers": NUM_WORKERS,
+            "sequence_length": SEQUENCE_LENGTH,
+            "reaction_delay": REACTION_DELAY,
+            "rollout_steps": ROLL_OUT_STEPS,
+            # model config
+            **cfg.__dict__,
+        }
+    )
 
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
         epoch_loss = 0.0
-        batch_count = 0
+        batch_count= 0
 
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===\n")
-        for i, (batch_state, batch_target) in enumerate(dataloader, 1):
-            for k in batch_state:
-                batch_state[k] = batch_state[k].to(DEVICE)
-            for k in batch_target:
-                batch_target[k] = batch_target[k].to(DEVICE)
+        for i, (batch_state, batch_target) in enumerate(dataloader, start=1):
+            # move to device
+            for k,v in batch_state.items(): batch_state[k]= v.to(DEVICE)
+            for k,v in batch_target.items(): batch_target[k]= v.to(DEVICE)
 
-            preds = model(batch_state)
-            loss, loss_dict = compute_loss(preds, batch_target)
+            preds, loss_dict = model(batch_state), None
+            loss, loss_metrics = compute_loss(preds, batch_target)
 
             optimizer.zero_grad()
             loss.backward()
@@ -146,36 +155,38 @@ def train():
             batch_count += 1
 
             if i % 25 == 0:
-                print(f"[Batch {i}] Loss = {loss.item():.4f} "
-                      f"(main={loss_dict['loss_main']:.3f}, "
-                      f"c={loss_dict['loss_c']:.3f}, "
-                      f"l={loss_dict['loss_l']:.3f}, "
-                      f"r={loss_dict['loss_r']:.3f}, "
-                      f"btn={loss_dict['loss_btn']:.3f})")
+                print(
+                    f"[Batch {i}] Loss={loss.item():.4f} "
+                    f"(main={loss_metrics['loss_main']:.3f}, c={loss_metrics['loss_c']:.3f}, "
+                    f"l={loss_metrics['loss_l']:.3f}, r={loss_metrics['loss_r']:.3f}, "
+                    f"btn={loss_metrics['loss_btn']:.3f})"
+                )
 
-        avg = epoch_loss / batch_count
-        print(f"\nEpoch {epoch} complete. Avg Loss: {avg:.4f}")
+        avg_loss = epoch_loss / batch_count
+        print(f"\nEpoch {epoch} complete. Avg Loss: {avg_loss:.4f}")
 
-        # Save checkpoint
+        # Save checkpoint (with config)
         os.makedirs("checkpoints", exist_ok=True)
-        ckpt = f"checkpoints/epoch_{epoch:02d}.pt"
-        torch.save({
+        ckpt = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-        }, ckpt)
-        print(f"Saved checkpoint to {ckpt}")
+            "config": cfg.__dict__,
+        }
+        ckpt_path = f"checkpoints/epoch_{epoch:02d}.pt"
+        torch.save(ckpt, ckpt_path)
+        print(f"Saved checkpoint to {ckpt_path}")
 
         # Log to wandb
         wandb.log({
             "epoch": epoch,
-            "avg_loss": avg,
-            **loss_dict,
-            "checkpoint": ckpt,
+            "avg_loss": avg_loss,
+            **loss_metrics,
+            "checkpoint": ckpt_path,
         })
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Entry
+# 6. Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     train()

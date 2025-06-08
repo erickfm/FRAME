@@ -1,51 +1,52 @@
+# sanity_check.py
+from pathlib import Path
 import torch
+
 from dataset import MeleeFrameDatasetWithDelay
-from model import FramePredictor, ModelConfig
+from model import FramePredictor, derive_config_from_dataset
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-
-# Dataset config (same as in train.py)
-dataset = MeleeFrameDatasetWithDelay(
-    parquet_dir="./data",
+# 1) Build the dataset (point to a few small test parquets to start)
+data_dir = Path("./data")          # adjust as needed
+ds = MeleeFrameDatasetWithDelay(
+    parquet_dir=data_dir,
     sequence_length=30,
-    reaction_delay=6,
+    reaction_delay=1,
 )
-print(f"Loaded {len(dataset)} frame sequences.")
 
-# Get a single sample
-frame_dict, target = dataset[0]
-for k in frame_dict:
-    print(f"{k:20s}: {frame_dict[k].shape}  dtype={frame_dict[k].dtype}")
-for k in target:
-    print(f"{k:20s}: {target[k].shape}  dtype={target[k].dtype}")
+# 2) Derive a ModelConfig that matches ds’s categorical vocab sizes
+cfg = derive_config_from_dataset(ds)
 
-# Batchify (1 item → 1 batch)
-for k in frame_dict:
-    frame_dict[k] = frame_dict[k].unsqueeze(0)  # [1, W] or [1, W, D]
-for k in target:
-    target[k] = target[k].unsqueeze(0)          # [1, D]
+# 3) Instantiate the predictor
+model = FramePredictor(cfg)
+model.eval()                       # disable dropout for the check
 
-# Load model
-cfg = ModelConfig(
-    max_seq_len=30,
-    num_stages=32,
-    num_ports=4,
-    num_characters=26,
-    num_actions=88,
-    num_costumes=6,
-    num_proj_types=160,
-    num_proj_subtypes=40,
-)
-model = FramePredictor(cfg).to(DEVICE)
-model.eval()
+# 4) Grab a mini-batch from the dataset
+batch_size = 2
+idxs = torch.randint(0, len(ds), (batch_size,))
+frames, targets = zip(*(ds[i] for i in idxs))
 
-# Move to device
-frame_dict = {k: v.to(DEVICE) for k, v in frame_dict.items()}
+# Stack dicts → dict of tensors (B,T,…)
+def stack_dicts(samples):
+    out = {}
+    for k in samples[0]:
+        out[k] = torch.stack([s[k] for s in samples], dim=0)
+    return out
 
-# Run forward pass
+frames = stack_dicts(frames)
+
+# 5) Forward pass
 with torch.no_grad():
-    out = model(frame_dict)
+    preds = model(frames)
 
-print("\nPredicted output:")
-for k, v in out.items():
-    print(f"{k:12s}: {tuple(v.shape)}")
+# 6) Print shapes
+print("=== Sanity check shapes ===")
+for name, tensor in preds.items():
+    print(f"{name:10s} {tuple(tensor.shape)}")
+
+# 7) Optional quick loss check (MSE on analog sticks)
+mse = torch.nn.functional.mse_loss(
+    preds["main_xy"],
+    torch.stack([t["main_x"].view(-1, 1).repeat(1, 2)  # crude reshape just for demo
+                 for t in targets], dim=0)
+)
+print("Dummy MSE (main_xy vs. target main_x):", mse.item())

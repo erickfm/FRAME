@@ -38,7 +38,7 @@ class FrameEncoder(nn.Module):
     PROJ_NUM_PER = 5
     PROJ_SLOTS   = 8
 
-    # Per-group output dimensions (edit freely)
+    # Per-group output dimensions
     FEATURE_DIMS = {
         # Categorical groups
         "stage":        64,
@@ -64,7 +64,6 @@ class FrameEncoder(nn.Module):
         "nana_flags":   64,
     }
 
-    # ------------------------------------------------------------
     def __init__(
         self,
         num_stages: int,
@@ -88,10 +87,10 @@ class FrameEncoder(nn.Module):
         self.ptype_emb  = nn.Embedding(num_proj_types,   D["proj_type"])
         self.psub_emb   = nn.Embedding(num_proj_subtypes, D["proj_subtype"])
 
-        # Float / boolean encoders
+        # Float / boolean encoders (include action_elapsed)
         self.glob_enc       = _mlp(self.GLOBAL_NUM,                 D["global_numeric"])
-        self.num_enc        = _mlp(self.PLAYER_NUM,                 D["player_numeric"])
-        self.nana_num_enc   = _mlp(self.NANA_NUM,                   D["nana_numeric"])
+        self.num_enc        = _mlp(self.PLAYER_NUM + 1,            D["player_numeric"])
+        self.nana_num_enc   = _mlp(self.NANA_NUM + 1,              D["nana_numeric"])
         self.analog_enc     = _mlp(self.ANALOG_DIM,                 D["analog"])
         self.proj_num_enc   = _mlp(self.PROJ_NUM_PER * self.PROJ_SLOTS, D["proj_numeric"])
         self.btn_enc        = _mlp(self.BTN_DIM * 2,                D["buttons"])
@@ -121,7 +120,7 @@ class FrameEncoder(nn.Module):
         # Dropout applied to concatenated features
         self.concat_dropout = nn.Dropout(DROPOUT_P)
 
-        # Final projection to 256-dim
+        # Final projection to d_model
         self.proj = nn.Sequential(
             nn.LayerNorm(self.total_dim),
             nn.Linear(self.total_dim, d_model),
@@ -129,26 +128,14 @@ class FrameEncoder(nn.Module):
             nn.Dropout(DROPOUT_P),
         )
 
-    # ------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------
     def _embed(self, emb: nn.Embedding, x: torch.Tensor) -> torch.Tensor:
-        """
-        Embed categorical tensor of shape (B, T) → (B, T, D).
-        """
         B, T = x.shape
         return emb(x.flatten()).reshape(B, T, -1)
 
     def _apply_mlp(self, mlp: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply MLP to numeric/boolean tensor (B, T, D_in) → (B, T, D_out).
-        """
         B, T = x.shape[:2]
         return mlp(x.reshape(B * T, -1)).reshape(B, T, -1)
 
-    # ------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------
     def forward(self, seq: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Parameters
@@ -183,13 +170,25 @@ class FrameEncoder(nn.Module):
             cat_parts.append(self._embed(self.ptype_emb, seq[f"proj{j}_type"]))
             cat_parts.append(self._embed(self.psub_emb,  seq[f"proj{j}_subtype"]))
 
-        # ── Numeric / boolean encodings
+        # ── Numeric / boolean encodings (action_elapsed folded into numeric)
         dense_parts = [
             self._apply_mlp(self.glob_enc,       seq["numeric"]),
-            self._apply_mlp(self.num_enc,        seq["self_numeric"]),
-            self._apply_mlp(self.num_enc,        seq["opp_numeric"]),
-            self._apply_mlp(self.nana_num_enc,   seq["self_nana_numeric"]),
-            self._apply_mlp(self.nana_num_enc,   seq["opp_nana_numeric"]),
+            self._apply_mlp(
+                self.num_enc,
+                torch.cat([seq["self_numeric"], seq["self_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+            ),
+            self._apply_mlp(
+                self.num_enc,
+                torch.cat([seq["opp_numeric"], seq["opp_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+            ),
+            self._apply_mlp(
+                self.nana_num_enc,
+                torch.cat([seq["self_nana_numeric"], seq["self_nana_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+            ),
+            self._apply_mlp(
+                self.nana_num_enc,
+                torch.cat([seq["opp_nana_numeric"], seq["opp_nana_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+            ),
             self._apply_mlp(self.analog_enc,     seq["self_analog"]),
             self._apply_mlp(self.analog_enc,     seq["opp_analog"]),
             self._apply_mlp(self.analog_enc,     seq["self_nana_analog"]),
