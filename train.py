@@ -69,7 +69,7 @@ def compute_loss(preds, targets):
     loss_r    = mse(r_pred, r_target)
     loss_btn  = bce(btn_pred, btn_target)
 
-    total = loss_main + loss_c + loss_l + loss_r + loss_btn
+    total = (10 * loss_main) + (10 * loss_c) + loss_l + loss_r + loss_btn
     return total, {
         "loss_main": loss_main.item(),
         "loss_c":    loss_c.item(),

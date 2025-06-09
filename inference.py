@@ -128,11 +128,16 @@ def run_inference(win_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     return {k: v.cpu().squeeze(0) for k, v in preds.items()}
 
 # ─── 4) Controller output (unchanged) ───────────────────────────────────────
-def press_output(controller: melee.Controller, output: Dict[str, torch.Tensor], thresh: float = 0.5):
+def press_output(controller: melee.Controller, output: Dict[str, torch.Tensor], thresh: float = 0.7):
     mx, my = output["main_xy"].tolist()
     cx, cy = output["c_xy"].tolist()
-    controller.tilt_analog_unit(melee.enums.Button.BUTTON_MAIN, mx, my)
-    controller.tilt_analog_unit(melee.enums.Button.BUTTON_C,    cx, cy)
+    # print(mx, my)
+    print(cx, cy)
+    # import random
+    # if random.random() > .7:
+    #     mx = my = cx = cy = 0.5
+    controller.tilt_analog(melee.enums.Button.BUTTON_MAIN, mx, my)
+    controller.tilt_analog(melee.enums.Button.BUTTON_C,    cx, cy)
     controller.press_shoulder(melee.enums.Button.BUTTON_L, output["L_val"].item())
     controller.press_shoulder(melee.enums.Button.BUTTON_R, output["R_val"].item())
 
@@ -144,7 +149,7 @@ def press_output(controller: melee.Controller, output: Dict[str, torch.Tensor], 
         melee.enums.Button.BUTTON_D_UP, melee.enums.Button.BUTTON_D_DOWN,
         melee.enums.Button.BUTTON_D_LEFT, melee.enums.Button.BUTTON_D_RIGHT,
     ]
-    print(output["btn_probs"], idx_to_button)
+
     for prob, btn in zip(output["btn_probs"], idx_to_button):
         if prob.item() > thresh:
             controller.press_button(btn)
@@ -198,10 +203,10 @@ if __name__ == "__main__":
             p1, c1 = ports[1], controllers[ports[1]]
             melee.MenuHelper().menu_helper_simple(gs, c0, melee.Character.FALCO,
                                                  melee.Stage.POKEMON_STADIUM,
-                                                 cpu_level=1, autostart=1)
+                                                 cpu_level=0, autostart=0)
             melee.MenuHelper().menu_helper_simple(gs, c1, melee.Character.FALCO,
                                                  melee.Stage.POKEMON_STADIUM,
-                                                 cpu_level=0, autostart=0)
+                                                 cpu_level=1, autostart=1)
             continue
 
         # build frame dict with proj{k}_frame included
@@ -267,7 +272,7 @@ if __name__ == "__main__":
         rows_deque.append(row)
         if len(rows_deque) == ROLLING_WINDOW:
             pred = run_inference(list(rows_deque))
-            ctrl = controllers[ports[1]]
+            ctrl = controllers[ports[0]]
             ctrl.release_all()
             press_output(ctrl, pred)
             ctrl.flush()
