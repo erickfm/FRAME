@@ -29,23 +29,24 @@ from cat_maps import (
 @dataclass
 class ModelConfig:
     # model size
-    d_model: int = 256
+    d_model: int = 512
     nhead: int = 8
-    num_layers: int = 6
+    num_layers: int = 4
     dim_feedforward: int = 1024
-    dropout: float = 0.1
+    dropout: float = 0.2
 
     # sequence length
-    max_seq_len: int = 120  # maximum window size (W / T)
+    max_seq_len: int = 120                # maximum window size (W / T)
 
-    # fixed categorical vocab sizes (source of truth from cat_maps.py)
-    num_stages: int         = len(STAGE_MAP)           # enum
-    num_ports: int          = 4                        # GC ports 1-4
-    num_characters: int     = len(CHARACTER_MAP)       # enum
-    num_actions: int        = len(ACTION_MAP)          # enum
-    num_costumes: int       = 6                        # 0–5 (vanilla)
-    num_proj_types: int     = len(PROJECTILE_TYPE_MAP) # enum
-    num_proj_subtypes: int  = 40                       # fixed universe size
+    # fixed categorical vocab sizes
+    num_stages: int         = len(STAGE_MAP)
+    num_ports: int          = 4           # GC ports 1-4
+    num_characters: int     = len(CHARACTER_MAP)
+    num_actions: int        = len(ACTION_MAP)
+    num_costumes: int       = 6           # 0–5 (vanilla)
+    num_c_dirs: int         = 5           # neutral, up, down, left, right
+    num_proj_types: int     = len(PROJECTILE_TYPE_MAP)
+    num_proj_subtypes: int  = 40          # fixed universe size
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Attention + Transformer block
@@ -64,7 +65,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         W = x.shape[1]
         mask = torch.triu(
-            torch.full((W, W), float('-inf'), device=x.device),
+            torch.full((W, W), float("-inf"), device=x.device),
             diagonal=1,
         )
         out, _ = self.attn(x, x, x, attn_mask=mask)
@@ -89,10 +90,8 @@ class TransformerBlock(nn.Module):
         self.drop2 = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # self-attention block
-        x = x + self.drop1(self.self_attn(self.norm1(x)))
-        # feed-forward block
-        x = x + self.drop2(self.ff(self.norm2(x)))
+        x = x + self.drop1(self.self_attn(self.norm1(x)))  # attention
+        x = x + self.drop2(self.ff(self.norm2(x)))         # feed-forward
         return x
 
 
@@ -101,10 +100,11 @@ class TransformerBlock(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 class PredictionHeads(nn.Module):
     """
-    Outputs:
-      - main_xy, c_xy    ∈ [-1, 1]
-      - L_val, R_val     ∈ [0, 1]
-      - btn_logits/probs 12-way multi-label
+    Outputs per next-frame target:
+      - main_xy          ∈ [-1, 1]              (regression, MSE/L1)
+      - L_val, R_val     ∈ [0, 1]               (regression, MSE)
+      - c_dir_logits  5-way logits              (classification, BCE w/ one-hot)
+      - btn_logits       12-way logits          (multi-label BCE)
     """
     def __init__(self, d_model: int, hidden: int = 64, btn_threshold: float = 0.5):
         super().__init__()
@@ -116,26 +116,27 @@ class PredictionHeads(nn.Module):
                 layers.append(activation)
             return nn.Sequential(*layers)
 
-        self.main_head = build(2, nn.Tanh())
-        self.c_head    = build(2, nn.Tanh())
-        self.L_head    = build(1, nn.Sigmoid())
-        self.R_head    = build(1, nn.Sigmoid())
-        self.btn_head  = build(12)
+        self.main_head  = build(2, nn.Tanh())
+        self.L_head     = build(1, nn.Sigmoid())
+        self.R_head     = build(1, nn.Sigmoid())
+        self.cdir_head  = build(5)                # raw logits
+        self.btn_head   = build(12)               # raw logits
 
     def forward(self, h: torch.Tensor) -> Dict[str, torch.Tensor]:
-        main_xy    = self.main_head(h)
-        c_xy       = self.c_head(h)
-        L_val      = self.L_head(h)
-        R_val      = self.R_head(h)
-        btn_logits = self.btn_head(h)
-        btn_probs  = torch.sigmoid(btn_logits)
+        main_xy      = self.main_head(h)
+        L_val        = self.L_head(h)
+        R_val        = self.R_head(h)
+        c_dir_logits = self.cdir_head(h)
+        btn_logits   = self.btn_head(h)
+
         return dict(
             main_xy=main_xy,
-            c_xy=c_xy,
             L_val=L_val,
             R_val=R_val,
+            c_dir_logits=c_dir_logits,
+            c_dir_probs=torch.sigmoid(c_dir_logits),
             btn_logits=btn_logits,
-            btn_probs=btn_probs,
+            btn_probs=torch.sigmoid(btn_logits),
         )
 
     def threshold_buttons(self, btn_probs: torch.Tensor) -> torch.Tensor:
@@ -154,11 +155,10 @@ class FramePredictor(nn.Module):
     """
     def __init__(self, cfg: ModelConfig, encoder: Optional[nn.Module] = None):
         super().__init__()
-        # Avoid circular import
+        # avoid circular import
         from frame_encoder import FrameEncoder
 
         self.cfg = cfg
-        # use provided encoder or default
         self.encoder = encoder or FrameEncoder(
             num_stages=cfg.num_stages,
             num_ports=cfg.num_ports,
@@ -168,6 +168,7 @@ class FramePredictor(nn.Module):
             num_proj_types=cfg.num_proj_types,
             num_proj_subtypes=cfg.num_proj_subtypes,
             d_model=cfg.d_model,
+            num_c_dirs=cfg.num_c_dirs,
         )
 
         # learned positional embeddings
@@ -175,15 +176,15 @@ class FramePredictor(nn.Module):
 
         # transformer stack
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
+
         # prediction heads
         self.heads = PredictionHeads(cfg.d_model)
 
     def forward(self, frames: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        x = self.encoder(frames)  # (B, T, d_model)
+        x = self.encoder(frames)                         # (B, T, d_model)
         T = x.size(1)
-        x = x + self.pos_emb[:, :T]
+        x = x + self.pos_emb[:, :T]                      # add positional info
         for blk in self.blocks:
             x = blk(x)
-        # take last time-step
-        h_last = x[:, -1]
+        h_last = x[:, -1]                                # final step
         return self.heads(h_last)
