@@ -28,25 +28,25 @@ from cat_maps import (
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ModelConfig:
-    # model size
-    d_model: int = 512
-    nhead: int = 8
-    num_layers: int = 4
-    dim_feedforward: int = 1024
-    dropout: float = 0.2
+    # model size (tiny “overfit” test)
+    d_model: int         = 64      # was 512
+    nhead: int           = 4       # d_model must be divisible by nhead
+    num_layers: int      = 1       # was 4
+    dim_feedforward: int = 256     # was 1024
+    dropout: float       = 0.0     # turn off dropout to help overfit
 
     # sequence length
-    max_seq_len: int = 120                # maximum window size (W / T)
+    max_seq_len: int     = 32      # was 120
 
-    # fixed categorical vocab sizes
-    num_stages: int         = len(STAGE_MAP)
-    num_ports: int          = 4           # GC ports 1-4
-    num_characters: int     = len(CHARACTER_MAP)
-    num_actions: int        = len(ACTION_MAP)
-    num_costumes: int       = 6           # 0–5 (vanilla)
-    num_c_dirs: int         = 5           # neutral, up, down, left, right
-    num_proj_types: int     = len(PROJECTILE_TYPE_MAP)
-    num_proj_subtypes: int  = 40          # fixed universe size
+    # fixed categorical vocab sizes (keep your real maps)
+    num_stages: int       = len(STAGE_MAP)
+    num_ports: int        = 4
+    num_characters: int   = len(CHARACTER_MAP)
+    num_actions: int      = len(ACTION_MAP)
+    num_costumes: int     = 6
+    num_c_dirs: int       = 5
+    num_proj_types: int   = len(PROJECTILE_TYPE_MAP)
+    num_proj_subtypes: int= 40
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Attention + Transformer block
