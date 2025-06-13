@@ -1,3 +1,4 @@
+# frame_encoder.py
 import torch
 import torch.nn as nn
 from typing import Dict
@@ -27,11 +28,11 @@ class FrameEncoder(nn.Module):
     to a dense (B, T, 256) embedding, with per-feature dims and dropout.
     """
 
-    # Raw input dimensions from dataset spec
+    # Raw input dimensions derived from dataset spec
     GLOBAL_NUM   = 20
     PLAYER_NUM   = 22
     NANA_NUM     = 27
-    ANALOG_DIM   = 6
+    ANALOG_DIM   = 4          # main_x, main_y, l_shldr, r_shldr (no c-stick)
     BTN_DIM      = 12
     FLAGS_DIM    = 5
     NANA_FLAGS   = 6
@@ -46,6 +47,7 @@ class FrameEncoder(nn.Module):
         "character":    128,
         "action":       128,
         "costume":      1,
+        "c_dir":        16,      # NEW – 5-way c-stick direction
         "proj_owner":   32,
         "proj_type":    64,
         "proj_subtype": 64,
@@ -74,37 +76,40 @@ class FrameEncoder(nn.Module):
         num_proj_types: int,
         num_proj_subtypes: int,
         d_model: int = 256,
+        num_c_dirs: int = 5,   # fixed 0-4 mapping
     ):
         super().__init__()
         D = self.FEATURE_DIMS  # shorthand
 
-        # Categorical embeddings
-        self.stage_emb  = nn.Embedding(num_stages,   D["stage"])
-        self.port_emb   = nn.Embedding(num_ports,    D["port"])
-        self.char_emb   = nn.Embedding(num_characters, D["character"])
-        self.act_emb    = nn.Embedding(num_actions,  D["action"])
-        self.cost_emb   = nn.Embedding(num_costumes, D["costume"])
+        # ── Categorical embeddings
+        self.stage_emb  = nn.Embedding(num_stages,       D["stage"])
+        self.port_emb   = nn.Embedding(num_ports,        D["port"])
+        self.char_emb   = nn.Embedding(num_characters,   D["character"])
+        self.act_emb    = nn.Embedding(num_actions,      D["action"])
+        self.cost_emb   = nn.Embedding(num_costumes,     D["costume"])
+        self.cdir_emb   = nn.Embedding(num_c_dirs,       D["c_dir"])
         self.ptype_emb  = nn.Embedding(num_proj_types,   D["proj_type"])
         self.psub_emb   = nn.Embedding(num_proj_subtypes, D["proj_subtype"])
 
-        # Float / boolean encoders (include action_elapsed)
-        self.glob_enc       = _mlp(self.GLOBAL_NUM,                 D["global_numeric"])
-        self.num_enc        = _mlp(self.PLAYER_NUM + 1,            D["player_numeric"])
-        self.nana_num_enc   = _mlp(self.NANA_NUM + 1,              D["nana_numeric"])
-        self.analog_enc     = _mlp(self.ANALOG_DIM,                 D["analog"])
-        self.proj_num_enc   = _mlp(self.PROJ_NUM_PER * self.PROJ_SLOTS, D["proj_numeric"])
-        self.btn_enc        = _mlp(self.BTN_DIM * 2,                D["buttons"])
-        self.flag_enc       = _mlp(self.FLAGS_DIM * 2,              D["flags"])
-        self.nana_btn_enc   = _mlp(self.BTN_DIM * 2,                D["nana_buttons"])
-        self.nana_flag_enc  = _mlp(self.NANA_FLAGS * 2,             D["nana_flags"])
+        # ── Float / boolean encoders (action_elapsed folded into numeric)
+        self.glob_enc       = _mlp(self.GLOBAL_NUM,                       D["global_numeric"])
+        self.num_enc        = _mlp(self.PLAYER_NUM + 1,                  D["player_numeric"])
+        self.nana_num_enc   = _mlp(self.NANA_NUM + 1,                    D["nana_numeric"])
+        self.analog_enc     = _mlp(self.ANALOG_DIM,                       D["analog"])
+        self.proj_num_enc   = _mlp(self.PROJ_NUM_PER * self.PROJ_SLOTS,   D["proj_numeric"])
+        self.btn_enc        = _mlp(self.BTN_DIM * 2,                      D["buttons"])
+        self.flag_enc       = _mlp(self.FLAGS_DIM * 2,                    D["flags"])
+        self.nana_btn_enc   = _mlp(self.BTN_DIM * 2,                      D["nana_buttons"])
+        self.nana_flag_enc  = _mlp(self.NANA_FLAGS * 2,                   D["nana_flags"])
 
-        # Compute total concat dimension automatically
+        # ── Total concat dimension
         self.total_dim = sum([
             D["stage"],
             2 * D["port"],
             4 * D["character"],
             4 * D["action"],
             2 * D["costume"],
+            4 * D["c_dir"],                      # NEW
             self.PROJ_SLOTS * (D["proj_owner"] + D["proj_type"] + D["proj_subtype"]),
             D["global_numeric"],
             2 * D["player_numeric"],
@@ -117,10 +122,8 @@ class FrameEncoder(nn.Module):
             D["nana_flags"],
         ])
 
-        # Dropout applied to concatenated features
+        # ── Dropout + projection
         self.concat_dropout = nn.Dropout(DROPOUT_P)
-
-        # Final projection to d_model
         self.proj = nn.Sequential(
             nn.LayerNorm(self.total_dim),
             nn.Linear(self.total_dim, d_model),
@@ -128,6 +131,9 @@ class FrameEncoder(nn.Module):
             nn.Dropout(DROPOUT_P),
         )
 
+    # ---------------------------------------------------------------------
+    # Internals
+    # ---------------------------------------------------------------------
     def _embed(self, emb: nn.Embedding, x: torch.Tensor) -> torch.Tensor:
         B, T = x.shape
         return emb(x.flatten()).reshape(B, T, -1)
@@ -136,6 +142,9 @@ class FrameEncoder(nn.Module):
         B, T = x.shape[:2]
         return mlp(x.reshape(B * T, -1)).reshape(B, T, -1)
 
+    # ---------------------------------------------------------------------
+    # Forward
+    # ---------------------------------------------------------------------
     def forward(self, seq: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Parameters
@@ -159,10 +168,14 @@ class FrameEncoder(nn.Module):
             self._embed(self.act_emb,     seq["opp_action"]),
             self._embed(self.cost_emb,    seq["self_costume"]),
             self._embed(self.cost_emb,    seq["opp_costume"]),
+            self._embed(self.cdir_emb,    seq["self_c_dir"]),      # NEW
+            self._embed(self.cdir_emb,    seq["opp_c_dir"]),       # NEW
             self._embed(self.char_emb,    seq["self_nana_character"]),
             self._embed(self.char_emb,    seq["opp_nana_character"]),
             self._embed(self.act_emb,     seq["self_nana_action"]),
             self._embed(self.act_emb,     seq["opp_nana_action"]),
+            self._embed(self.cdir_emb,    seq["self_nana_c_dir"]), # NEW
+            self._embed(self.cdir_emb,    seq["opp_nana_c_dir"]),  # NEW
         ]
         # Projectile categorical embeddings
         for j in range(self.PROJ_SLOTS):
@@ -170,29 +183,41 @@ class FrameEncoder(nn.Module):
             cat_parts.append(self._embed(self.ptype_emb, seq[f"proj{j}_type"]))
             cat_parts.append(self._embed(self.psub_emb,  seq[f"proj{j}_subtype"]))
 
-        # ── Numeric / boolean encodings (action_elapsed folded into numeric)
+        # ── Numeric / boolean encodings
         dense_parts = [
-            self._apply_mlp(self.glob_enc,       seq["numeric"]),
+            self._apply_mlp(self.glob_enc,   seq["numeric"]),
             self._apply_mlp(
                 self.num_enc,
-                torch.cat([seq["self_numeric"], seq["self_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+                torch.cat(
+                    [seq["self_numeric"], seq["self_action_elapsed"].unsqueeze(-1).float()],
+                    dim=-1,
+                ),
             ),
             self._apply_mlp(
                 self.num_enc,
-                torch.cat([seq["opp_numeric"], seq["opp_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+                torch.cat(
+                    [seq["opp_numeric"], seq["opp_action_elapsed"].unsqueeze(-1).float()],
+                    dim=-1,
+                ),
             ),
             self._apply_mlp(
                 self.nana_num_enc,
-                torch.cat([seq["self_nana_numeric"], seq["self_nana_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+                torch.cat(
+                    [seq["self_nana_numeric"], seq["self_nana_action_elapsed"].unsqueeze(-1).float()],
+                    dim=-1,
+                ),
             ),
             self._apply_mlp(
                 self.nana_num_enc,
-                torch.cat([seq["opp_nana_numeric"], seq["opp_nana_action_elapsed"].unsqueeze(-1).float()], dim=-1)
+                torch.cat(
+                    [seq["opp_nana_numeric"], seq["opp_nana_action_elapsed"].unsqueeze(-1).float()],
+                    dim=-1,
+                ),
             ),
-            self._apply_mlp(self.analog_enc,     seq["self_analog"]),
-            self._apply_mlp(self.analog_enc,     seq["opp_analog"]),
-            self._apply_mlp(self.analog_enc,     seq["self_nana_analog"]),
-            self._apply_mlp(self.analog_enc,     seq["opp_nana_analog"]),
+            self._apply_mlp(self.analog_enc, seq["self_analog"]),
+            self._apply_mlp(self.analog_enc, seq["opp_analog"]),
+            self._apply_mlp(self.analog_enc, seq["self_nana_analog"]),
+            self._apply_mlp(self.analog_enc, seq["opp_nana_analog"]),
             self._apply_mlp(
                 self.proj_num_enc,
                 torch.cat([seq[f"{k}_numeric"] for k in map(str, range(self.PROJ_SLOTS))], dim=-1),
@@ -215,7 +240,7 @@ class FrameEncoder(nn.Module):
             ),
         ]
 
-        # ── Concatenate all features, apply dropout, project
-        concat = torch.cat(cat_parts + dense_parts, dim=-1)     # (B, T, total_dim)
-        concat = self.concat_dropout(concat)                    # dropout on full vector
-        return self.proj(concat)                                # (B, T, 256)
+        # ── Concatenate, dropout, project
+        concat = torch.cat(cat_parts + dense_parts, dim=-1)  # (B, T, total_dim)
+        concat = self.concat_dropout(concat)
+        return self.proj(concat)                             # (B, T, d_model)

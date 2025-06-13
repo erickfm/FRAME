@@ -1,147 +1,205 @@
 #!/usr/bin/env python3
-# inference.py
-#
-# Real-time Melee inference mirroring MeleeFrameDatasetWithDelay → FramePredictor.
+# inference.py  –  FRAME real-time bot
+# --------------------------------------------------------------------------
+# * Sanitises any NaN/Inf weights on load
+# * Mirrors Dataset preprocessing (inc. c-stick categorical)
+# * Converts model outputs to Dolphin controller actions
+# * Optional DEBUG hooks and asserts
+# --------------------------------------------------------------------------
 
-import argparse
-import signal
-import sys
-from pathlib import Path
+import math, signal, sys
 from collections import deque
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import melee
 
-# ─── your existing maps & model imports ─────────────────────────────────────
+# ─────────────── User flags ───────────────────
+DEBUG = False          # True = extra asserts + hooks
+PRINT_BAD_ROWS = False # print raw non-finite values
+# ───────────────────────────────────────────────
+
 from cat_maps import STAGE_MAP, CHARACTER_MAP, ACTION_MAP, PROJECTILE_TYPE_MAP
-from model import FramePredictor, ModelConfig
-from dataset import MeleeFrameDatasetWithDelay  # only for its spec
+from model    import FramePredictor, ModelConfig
+from dataset  import MeleeFrameDatasetWithDelay
 
-# ─── 0) Device & checkpoint load (unchanged) ───────────────────────────────
+# ══════════════════════════════════════════════
+# 0) Device & checkpoint
+# ══════════════════════════════════════════════
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {DEVICE}")
 
-ckpt_files = list(Path("./checkpoints").glob("epoch_*.pt"))
-ckpt_path  = max(ckpt_files, key=lambda p: p.stat().st_mtime, default=None)
-if ckpt_path is None:
-    print("No checkpoint found – exiting."); sys.exit(1)
-
-ckpt = torch.load(ckpt_path, map_location=DEVICE)
-cfg  = ModelConfig(**ckpt.get("config", {}))
-print(f"Reconstructed ModelConfig: {cfg}")
+ckpts = sorted(Path("./checkpoints").glob("epoch_*.pt"))
+if not ckpts:
+    sys.exit("No checkpoints found in ./checkpoints")
+ckpt_path = max(ckpts, key=lambda p: p.stat().st_mtime)
+ckpt      = torch.load(ckpt_path, map_location=DEVICE)
+cfg       = ModelConfig(**ckpt["config"])
 
 model = FramePredictor(cfg).to(DEVICE)
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
-print(f"Loaded checkpoint: {ckpt_path}")
+print("Loaded", ckpt_path, "→", DEVICE)
 
-ROLLING_WINDOW = cfg.max_seq_len
-MAX_PROJ       = 8
+# ── 0.a  Sanitise non-finite parameters ------------------------------------
+reinit = 0
+for name, param in model.named_parameters():
+    if not torch.isfinite(param).all():
+        reinit += 1
+        if param.ndim > 1:  # matrices / pos_emb
+            nn.init.kaiming_uniform_(param, a=math.sqrt(5))
+        else:               # biases / 1-d tensors
+            nn.init.zeros_(param)
+        print(f"[SANITIZE] Re-initialised '{name}'")
+if reinit:
+    print(f"[SANITIZE] Fixed {reinit} parameter(s); continuing…")
 
-# ─── 1) Re-use Dataset’s grouping & categorical spec ────────────────────────
+# ══════════════════════════════════════════════
+# 0.b Optional debug hooks
+# ══════════════════════════════════════════════
+if DEBUG:
+    def nan_hook(mod, _, out):
+        t = out[0] if isinstance(out, tuple) else out
+        if not torch.isfinite(t).all():
+            print(f"[HOOK] NaN/Inf in {mod._hook_name}")
+            raise RuntimeError("Abort on non-finite layer")
+    for n, m in model.named_modules():
+        if isinstance(m, (nn.Linear, nn.LayerNorm, nn.MultiheadAttention)):
+            m._hook_name = n
+            m.register_forward_hook(nan_hook)
+
+# ══════════════════════════════════════════════
+# 1) Feature spec clone
+# ══════════════════════════════════════════════
 _spec = MeleeFrameDatasetWithDelay.__new__(MeleeFrameDatasetWithDelay)
-_spec.feature_groups     = _spec._build_feature_groups()
-_spec._categorical_cols  = [col for _, meta in _spec._walk_groups(return_meta=True)
-                             if meta["ftype"] == "categorical"
-                             for col in meta["cols"]]
-_spec._enum_maps         = {
-    "stage":      STAGE_MAP,
+_spec.feature_groups = _spec._build_feature_groups()
+_spec._categorical_cols = [
+    c for _, m in _spec._walk_groups(return_meta=True)
+    if m["ftype"] == "categorical" for c in m["cols"]
+]
+_spec._enum_maps = {
+    "stage": STAGE_MAP,
     "_character": CHARACTER_MAP,
-    "_action":    ACTION_MAP,
-    "_type":      PROJECTILE_TYPE_MAP,
+    "_action": ACTION_MAP,
+    "_type": PROJECTILE_TYPE_MAP,
+    "c_dir": {i: i for i in range(5)},  # 0-4 identity
 }
 
-# ─── 2) rows_to_state_seq: mirror Dataset.__getitem__ exactly ──────────────
-def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    # 1) Build DataFrame and drop timestamp
-    df = pd.DataFrame(rows).drop(columns=["startAt"], errors="ignore")
+# ══════════════════════════════════════════════
+# 2) Helpers
+# ══════════════════════════════════════════════
+def encode_c_dir(df: pd.DataFrame, p: str, dead=0.15):
+    dx = df[f"{p}_c_x"].astype(np.float32) - 0.5
+    dy = 0.5 - df[f"{p}_c_y"].astype(np.float32)
+    mag = np.hypot(dx, dy)
+    cat = np.zeros_like(mag, np.int64)
+    active = mag > dead
+    horiz  = active & (np.abs(dx) >= np.abs(dy))
+    vert   = active & (np.abs(dy)  > np.abs(dx))
+    cat[horiz & (dx > 0)] = 4
+    cat[horiz & (dx < 0)] = 3
+    cat[vert  & (dy > 0)] = 1
+    cat[vert  & (dy < 0)] = 2
+    df[f"{p}_c_dir"] = cat
 
-    # 2) Fill NaNs for numeric/bool
-    num_cols  = [c for c, t in df.dtypes.items() if t.kind in ("i","f")]
-    bool_cols = [c for c, t in df.dtypes.items() if t == "bool"]
+def _map_cat(col: str, x: Any) -> int:
+    if col == "stage":
+        return _spec._enum_maps["stage"].get(x, 0)
+    if col.endswith("_c_dir"):
+        return int(x) if 0 <= int(x) <= 4 else 0
+    for suf, mp in _spec._enum_maps.items():
+        if suf != "stage" and col.endswith(suf):
+            return mp.get(x, 0)
+    try:
+        return max(int(x), 0)
+    except:  # noqa: E722
+        return 0
+
+def assert_finite(t: torch.Tensor, tag: str):
+    if DEBUG and not torch.isfinite(t).all():
+        raise RuntimeError(f"NaN/Inf in {tag}")
+
+def maybe_print_bad_row(row, fid):
+    if PRINT_BAD_ROWS:
+        bad = {k:v for k,v in row.items() if isinstance(v,float) and not math.isfinite(v)}
+        if bad: print(f"[RAW] non-finite at frame {fid}: {bad}")
+
+# ══════════════════════════════════════════════
+# 3) rows → state_seq
+# ══════════════════════════════════════════════
+def rows_to_state_seq(rows: List[Dict[str, Any]]):
+    df = pd.DataFrame(rows).drop(columns=["startAt"], errors="ignore")
+    df.replace([np.inf, -np.inf], 0.0, inplace=True)
+
+    for p in ("self", "opp", "self_nana", "opp_nana"):
+        if f"{p}_c_x" in df.columns:
+            encode_c_dir(df, p)
+
+    num_cols  = [c for c,t in df.dtypes.items() if t.kind in ("i","f")]
+    bool_cols = [c for c,t in df.dtypes.items() if t == "bool"]
     df[num_cols]  = df[num_cols].fillna(0.0)
     df[bool_cols] = df[bool_cols].fillna(False)
 
-    # 3) Map categoricals via enum or raw int
-    def _map_cat(col: str, x: Any) -> int:
-        if col == "stage":
-            return _spec._enum_maps["stage"].get(x, 0)
-        for suf, m in _spec._enum_maps.items():
-            if suf != "stage" and col.endswith(suf):
-                return m.get(x, 0)
-        try:
-            return max(int(x), 0)
-        except:
-            return 0
+    miss_cat = [c for c in _spec._categorical_cols if c not in df.columns]
+    if miss_cat:
+        df = pd.concat([df, pd.DataFrame({c:0 for c in miss_cat}, index=df.index)], axis=1)
 
-    for c in _spec._categorical_cols:
-        df[c] = (
-            df[c]
-            .fillna(0)
-            .map(lambda x, col=c: _map_cat(col, x))
-            .astype("int64")
-        )
+    for col in _spec._categorical_cols:
+        df[col] = df[col].map(lambda x,c=col: _map_cat(c,x)).astype("int64")
 
-    # 4) Prepare synthetic flags and stub missing geometry or button cols in bulk
-    new_cols: Dict[str, Any] = {}
-    # synthetic Nana flags
-    new_cols["self_nana_present"] = (df.get("self_nana_character", 0) > 0).astype("float32")
-    new_cols["opp_nana_present"]  = (df.get("opp_nana_character", 0) > 0).astype("float32")
-    # ensure all feature spec cols exist
-    for _, meta in _spec._walk_groups(return_meta=True):
-        for col in meta["cols"]:
-            if col not in df.columns:
-                if meta["ftype"] == "categorical":
-                    new_cols[col] = 0
-                else:
-                    new_cols[col] = 0.0
-    # Merge and defragment
-    df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1).copy()
+    df["self_nana_present"] = (df.get("self_nana_character",0)>0).astype("float32")
+    df["opp_nana_present"]  = (df.get("opp_nana_character",0)>0).astype("float32")
 
-    # 5) Assemble state_seq dict
-    state_seq: Dict[str, torch.Tensor] = {}
-    for _, meta in _spec._walk_groups(return_meta=True):
-        cols, ftype, entity = meta['cols'], meta['ftype'], meta['entity']
-        key = f"{entity}_{ftype}" if entity != "global" else ftype
+    miss_num = {}
+    for _, m in _spec._walk_groups(return_meta=True):
+        if m["ftype"] != "categorical":
+            for c in m["cols"]:
+                if c not in df.columns: miss_num[c] = 0.0
+    if miss_num:
+        df = pd.concat([df, pd.DataFrame(miss_num, index=df.index)], axis=1)
 
-        if ftype == "categorical":
+    seq = {}
+    for _, m in _spec._walk_groups(return_meta=True):
+        cols, t, ent = m["cols"], m["ftype"], m["entity"]
+        key = f"{ent}_{t}" if ent!="global" else t
+        if t=="categorical":
             for col in cols:
-                arr = df[col].values.astype("int64")
-                state_seq[col] = torch.from_numpy(arr).long().unsqueeze(0)
+                x = torch.from_numpy(df[col].values).long().unsqueeze(0)
+                assert_finite(x, col); seq[col]=x
         else:
-            mats = [torch.from_numpy(df[c].astype("float32").values) for c in cols]
-            tensor = torch.stack(mats, dim=-1) if len(mats) > 1 else mats[0]
-            state_seq[key] = tensor.unsqueeze(0)
+            mats=[torch.from_numpy(df[c].astype(np.float32).values) for c in cols]
+            x=(torch.stack(mats,-1) if len(mats)>1 else mats[0]).unsqueeze(0)
+            assert_finite(x,key); seq[key]=x
+    return seq
 
-    return state_seq
-
-# ─── 3) run_inference wrapper ───────────────────────────────────────────────
 @torch.no_grad()
-def run_inference(win_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+def infer(win_rows):
     batch = rows_to_state_seq(win_rows)
-    for k, v in batch.items():
-        batch[k] = v.to(DEVICE)
-    preds = model(batch)
-    return {k: v.cpu().squeeze(0) for k, v in preds.items()}
+    for k in batch: batch[k] = batch[k].to(DEVICE)
+    out = model(batch)
+    for k,v in out.items(): assert_finite(v, f"pred[{k}]")
+    return {k: v.cpu().squeeze(0) for k,v in out.items()}
 
-# ─── 4) Controller output (unchanged) ───────────────────────────────────────
-def press_output(controller: melee.Controller, output: Dict[str, torch.Tensor], thresh: float = 0.7):
-    mx, my = output["main_xy"].tolist()
-    cx, cy = output["c_xy"].tolist()
-    # print(mx, my)
-    print(cx, cy)
-    # import random
-    # if random.random() > .7:
-    #     mx = my = cx = cy = 0.5
-    controller.tilt_analog(melee.enums.Button.BUTTON_MAIN, mx, my)
-    controller.tilt_analog(melee.enums.Button.BUTTON_C,    cx, cy)
-    controller.press_shoulder(melee.enums.Button.BUTTON_L, output["L_val"].item())
-    controller.press_shoulder(melee.enums.Button.BUTTON_R, output["R_val"].item())
+# ══════════════════════════════════════════════
+# 4) Controller helpers
+# ══════════════════════════════════════════════
+C_LOOK = {0:(.5,.5),1:(.5,1),2:(.5,0),3:(0,.5),4:(1,.5)}
+def clamp(x, d=.5): return min(max(d if not math.isfinite(x) else x,0),1)
 
-    idx_to_button = [
+def press(ctrl, pred, th=.7):
+    mx,my = map(clamp, map(float, pred["main_xy"].tolist()))
+    cx,cy = C_LOOK[int(torch.argmax(pred["c_dir_logits"]))]
+    l,r   = clamp(pred["L_val"].item(),0), clamp(pred["R_val"].item(),0)
+
+    ctrl.tilt_analog(melee.enums.Button.BUTTON_MAIN, mx,my)
+    ctrl.tilt_analog(melee.enums.Button.BUTTON_C, cx,cy)
+    ctrl.press_shoulder(melee.enums.Button.BUTTON_L,l)
+    ctrl.press_shoulder(melee.enums.Button.BUTTON_R,r)
+
+    buttons=[
         melee.enums.Button.BUTTON_A, melee.enums.Button.BUTTON_B,
         melee.enums.Button.BUTTON_X, melee.enums.Button.BUTTON_Y,
         melee.enums.Button.BUTTON_Z, melee.enums.Button.BUTTON_L,
@@ -149,134 +207,102 @@ def press_output(controller: melee.Controller, output: Dict[str, torch.Tensor], 
         melee.enums.Button.BUTTON_D_UP, melee.enums.Button.BUTTON_D_DOWN,
         melee.enums.Button.BUTTON_D_LEFT, melee.enums.Button.BUTTON_D_RIGHT,
     ]
+    for p,b in zip(pred["btn_probs"],buttons):
+        (ctrl.press_button if p.item()>th else ctrl.release_button)(b)
 
-    for prob, btn in zip(output["btn_probs"], idx_to_button):
-        if prob.item() > thresh:
-            controller.press_button(btn)
-        else:
-            controller.release_button(btn)
+# ══════════════════════════════════════════════
+# 5) Dolphin loop
+# ══════════════════════════════════════════════
+def sigint(sig,_):
+    for c in ctrls.values(): c.disconnect()
+    console.stop(); sys.exit(0)
 
-# ─── 5) Signal handling & main loop (unchanged) ─────────────────────────────
-def check_port(value):
-    iv = int(value)
-    if iv not in {1,2,3,4}:
-        raise argparse.ArgumentTypeError("Port must be 1-4")
-    return iv
-
-def signal_handler(sig, frame):
-    for ctrl in controllers.values():
-        ctrl.disconnect()
-    console.stop()
-    print("Shutting down…")
-    sys.exit(0)
-
-if __name__ == "__main__":
+if __name__=="__main__":
     DOLPHIN_APP = "/Users/erick/Library/Application Support/Slippi Launcher/netplay/Slippi Dolphin.app"
     ISO_PATH    = "/Users/erick/Downloads/melee.iso"
 
     console = melee.Console(path=DOLPHIN_APP, slippi_address="127.0.0.1", fullscreen=False)
-    ports = [1, 2]
-    controllers = {
-        p: melee.Controller(console=console, port=p, type=melee.ControllerType.STANDARD)
-        for p in ports
-    }
+    ports=[1,2]
+    ctrls={p: melee.Controller(console,p) for p in ports}
 
-    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGINT, sigint)
     console.run(iso_path=ISO_PATH)
+    if not console.connect(): sys.exit("Dolphin connect fail")
+    for c in ctrls.values():
+        if not c.connect(): sys.exit("Pad connect fail")
 
-    if not console.connect():
-        print("Failed to connect to console."); sys.exit(1)
-    for ctrl in controllers.values():
-        if not ctrl.connect():
-            print("Failed to connect controller."); sys.exit(1)
-    print("Console + controllers connected.")
-
-    rows_deque = deque(maxlen=ROLLING_WINDOW)
+    rows=deque(maxlen=cfg.max_seq_len)
 
     while True:
-        gs = console.step()
-        if gs is None:
-            continue
+        gs=console.step()
+        if gs is None: continue
 
+        # menu helper (unchanged) ............................
         if gs.menu_state not in (melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH):
-            p0, c0 = ports[0], controllers[ports[0]]
-            p1, c1 = ports[1], controllers[ports[1]]
-            melee.MenuHelper().menu_helper_simple(gs, c0, melee.Character.FALCO,
+            c0,c1=ctrls[ports[0]],ctrls[ports[1]]
+            melee.MenuHelper().menu_helper_simple(gs,c0,melee.Character.FALCO,
                                                  melee.Stage.POKEMON_STADIUM,
-                                                 cpu_level=0, autostart=0)
-            melee.MenuHelper().menu_helper_simple(gs, c1, melee.Character.FALCO,
+                                                 cpu_level=0,autostart=0)
+            melee.MenuHelper().menu_helper_simple(gs,c1,melee.Character.FALCO,
                                                  melee.Stage.POKEMON_STADIUM,
-                                                 cpu_level=1, autostart=1)
+                                                 cpu_level=1,autostart=1)
             continue
 
-        # build frame dict with proj{k}_frame included
-        row: Dict[str, Any] = {}
-        row["stage"]    = gs.stage.name if gs.stage else ""
-        row["frame"]    = gs.frame
-        row["distance"] = gs.distance
-        row["startAt"]  = gs.startAt
+        # build row ..........................................
+        row: Dict[str,Any]={"stage":gs.stage.name if gs.stage else "",
+                            "frame":gs.frame,"distance":gs.distance,"startAt":gs.startAt}
 
-        for idx, (port, ps) in enumerate(gs.players.items()):
-            pref = "self_" if idx == 0 else "opp_"
-            row[f"{pref}port"]          = port
-            row[f"{pref}character"]     = ps.character.name
-            row[f"{pref}action"]        = ps.action.name
-            row[f"{pref}action_frame"]  = ps.action_frame
-            row[f"{pref}costume"]       = ps.costume
+        for idx,(port,ps) in enumerate(gs.players.items()):
+            pref="self_" if idx==0 else "opp_"
+            row.update({
+                f"{pref}port":port,
+                f"{pref}character":ps.character.name,
+                f"{pref}action":ps.action.name,
+                f"{pref}action_frame":ps.action_frame,
+                f"{pref}costume":ps.costume,
+                f"{pref}main_x":ps.controller_state.main_stick[0],
+                f"{pref}main_y":ps.controller_state.main_stick[1],
+                f"{pref}c_x":ps.controller_state.c_stick[0],
+                f"{pref}c_y":ps.controller_state.c_stick[1],
+                f"{pref}l_shldr":ps.controller_state.l_shoulder,
+                f"{pref}r_shldr":ps.controller_state.r_shoulder,
+                f"{pref}percent":float(ps.percent),
+                f"{pref}pos_x":float(ps.position.x),
+                f"{pref}pos_y":float(ps.position.y),
+            })
+            for b,s in ps.controller_state.button.items():
+                row[f"{pref}btn_{b.name}"]=int(s)
 
-            for btn, st in ps.controller_state.button.items():
-                row[f"{pref}btn_{btn.name}"] = int(st)
-
-            row[f"{pref}main_x"], row[f"{pref}main_y"] = ps.controller_state.main_stick
-            row[f"{pref}c_x"],     row[f"{pref}c_y"]   = ps.controller_state.c_stick
-            row[f"{pref}l_shldr"]   = ps.controller_state.l_shoulder
-            row[f"{pref}r_shldr"]   = ps.controller_state.r_shoulder
-
-            row[f"{pref}percent"] = float(ps.percent)
-            row[f"{pref}pos_x"]   = float(ps.position.x)
-            row[f"{pref}pos_y"]   = float(ps.position.y)
-
-            nana = ps.nana
-            npref = f"{pref}nana_"
+            nana,np=ps.nana,f"{pref}nana_"
             if nana:
-                row[f"{npref}character"]    = nana.character.name
-                row[f"{npref}action"]       = nana.action.name
-                row[f"{npref}action_frame"] = nana.action_frame
+                row[f"{np}character"]=nana.character.name
+                row[f"{np}action"]=nana.action.name
+                row[f"{np}action_frame"]=nana.action_frame
             else:
-                row[f"{npref}character"]    = ""
-                row[f"{npref}action"]       = ""
-                row[f"{npref}action_frame"] = -1
+                row[f"{np}character"]=row[f"{np}action"]=""
+                row[f"{np}action_frame"]=-1
 
-        for j in range(MAX_PROJ):
-            pp = f"proj{j}_"
-            if j < len(gs.projectiles):
-                p = gs.projectiles[j]
-                row[f"{pp}owner"]   = p.owner
-                row[f"{pp}type"]    = p.type.name
-                row[f"{pp}subtype"] = p.subtype
-                row[f"{pp}pos_x"]   = float(p.position.x)
-                row[f"{pp}pos_y"]   = float(p.position.y)
-                row[f"{pp}speed_x"] = float(p.speed.x)
-                row[f"{pp}speed_y"] = float(p.speed.y)
-                row[f"{pp}frame"]   = p.frame
+        for j in range(8):
+            pp=f"proj{j}_"
+            if j<len(gs.projectiles):
+                p=gs.projectiles[j]
+                row.update({
+                    f"{pp}owner":p.owner,f"{pp}type":p.type.name,
+                    f"{pp}subtype":p.subtype,f"{pp}pos_x":float(p.position.x),
+                    f"{pp}pos_y":float(p.position.y),f"{pp}speed_x":float(p.speed.x),
+                    f"{pp}speed_y":float(p.speed.y),f"{pp}frame":p.frame})
             else:
-                row[f"{pp}owner"]   = -1
-                row[f"{pp}type"]    = ""
-                row[f"{pp}subtype"] = -1
-                row[f"{pp}pos_x"]   = float("nan")
-                row[f"{pp}pos_y"]   = float("nan")
-                row[f"{pp}speed_x"] = float("nan")
-                row[f"{pp}speed_y"] = float("nan")
-                row[f"{pp}frame"]   = -1
+                row.update({f"{pp}{fld}":(-1 if fld in ("owner","subtype","frame") else 0.0)
+                            for fld in ("owner","type","subtype","pos_x","pos_y",
+                                         "speed_x","speed_y","frame")})
+        maybe_print_bad_row(row, gs.frame)
+        rows.append(row)
 
-        rows_deque.append(row)
-        if len(rows_deque) == ROLLING_WINDOW:
-            pred = run_inference(list(rows_deque))
-            ctrl = controllers[ports[0]]
-            ctrl.release_all()
-            press_output(ctrl, pred)
-            ctrl.flush()
+        if len(rows)==cfg.max_seq_len:
+            pred=infer(list(rows))
+            pad=ctrls[ports[0]]
+            pad.release_all(); press(pad,pred); pad.flush()
 
-            if gs.frame % 60 == 0:
-                print(f"[Frame {gs.frame}] main_xy={pred['main_xy'].tolist()}  "
-                      f"btn_probs={pred['btn_probs'].tolist()[:4]}…")
+            if gs.frame%60==0:
+                print(f"[{gs.frame}] main={pred['main_xy'].tolist()} "
+                      f"cdir={int(torch.argmax(pred['c_dir_logits']))}")
