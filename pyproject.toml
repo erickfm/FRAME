@@ -1,19 +1,18 @@
-[project]
+[tool.poetry]
 name = "frame"
 version = "0.1.0"
 description = "FRAME: Fixed-step Realtime Action Matrix Estimator"
 authors = []
 readme = "README.md"
-requires-python = "^3.10"
-dependencies = [
-    "torch",
-    "numpy",
-    "pandas",
-    "pyarrow",
-    "melee",
-    "typing-extensions",
-]
 
+[tool.poetry.dependencies]
+python = "^3.10"
+torch = "*"
+numpy = "*"
+pandas = "*"
+pyarrow = "*"
+melee = "*"
+typing-extensions = "*"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
