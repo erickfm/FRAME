@@ -32,11 +32,11 @@ class ModelConfig:
     d_model: int         = 64      # was 512
     nhead: int           = 4       # d_model must be divisible by nhead
     num_layers: int      = 1       # was 4
-    dim_feedforward: int = 256     # was 1024
+    dim_feedforward: int = 128     # was 1024
     dropout: float       = 0.0     # turn off dropout to help overfit
 
     # sequence length
-    max_seq_len: int     = 32      # was 120
+    max_seq_len: int     = 60      # was 120
 
     # fixed categorical vocab sizes (keep your real maps)
     num_stages: int       = len(STAGE_MAP)
@@ -177,6 +177,9 @@ class FramePredictor(nn.Module):
         # transformer stack
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.num_layers)])
 
+        # final normalization for stability
+        self.final_norm = nn.LayerNorm(cfg.d_model)
+
         # prediction heads
         self.heads = PredictionHeads(cfg.d_model)
 
@@ -187,4 +190,5 @@ class FramePredictor(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         h_last = x[:, -1]                                # final step
+        h_last = self.final_norm(h_last)                # normalize for stability
         return self.heads(h_last)
