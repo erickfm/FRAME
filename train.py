@@ -1,10 +1,8 @@
-# train.py
-# ---------------------------------------------
-# FRAME next-frame predictor — training script
-# ---------------------------------------------
+#!/usr/bin/env python3
+# train.py  —  Debug training with loss + gradient inspection
+
 import os
 import torch
-import wandb
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.utils as nn_utils
@@ -18,13 +16,13 @@ from model   import FramePredictor, ModelConfig
 # ─────────────────────────────────────────────────────────────────────────────
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available()
-    else "mps"  if torch.backends.mps.is_available()
+    else "cpu"  if torch.backends.mps.is_available()
     else "cpu"
 )
 
 BATCH_SIZE      = 128
 NUM_EPOCHS      = 10
-LEARNING_RATE   = 3e-4
+LEARNING_RATE   = 3e-3
 NUM_WORKERS     = 4
 SEQUENCE_LENGTH = 30
 REACTION_DELAY  = 1
@@ -36,42 +34,42 @@ DATA_DIR        = "./data"
 def collate_fn(batch):
     batch_state, batch_target = {}, {}
     for k in batch[0][0]:
-        batch_state[k]  = torch.stack([item[0][k] for item in batch], 0)
+        batch_state[k] = torch.stack([item[0][k] for item in batch], 0)
     for k in batch[0][1]:
         batch_target[k] = torch.stack([item[1][k] for item in batch], 0)
     return batch_state, batch_target
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Loss
+# 3. Loss (raw sum) + metrics
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_loss(preds, targets):
     mse, bce = nn.MSELoss(), nn.BCEWithLogitsLoss()
 
-    main_pred   = preds["main_xy"]
-    l_pred      = preds["L_val"].squeeze(-1)
-    r_pred      = preds["R_val"].squeeze(-1)
-    cdir_pred   = preds["c_dir_logits"]
-    btn_pred    = preds["btn_logits"]
+    main_pred = preds["main_xy"]
+    l_pred    = preds["L_val"].squeeze(-1)
+    r_pred    = preds["R_val"].squeeze(-1)
+    cdir_pred = preds["c_dir_logits"]
+    btn_pred  = preds["btn_logits"]
 
-    main_tgt = torch.stack([targets["main_x"], targets["main_y"]], -1)
-    l_tgt    = targets["l_shldr"]
-    r_tgt    = targets["r_shldr"]
-    cdir_tgt = targets["c_dir"]
-    btn_tgt  = targets.get("btns", targets.get("btns_float")).float()
+    main_tgt  = torch.stack([targets["main_x"], targets["main_y"]], -1)
+    l_tgt     = targets["l_shldr"]
+    r_tgt     = targets["r_shldr"]
+    cdir_tgt  = targets["c_dir"]
+    btn_tgt   = targets.get("btns", targets.get("btns_float")).float()
 
-    loss_main  = mse(main_pred, main_tgt)
-    loss_l     = mse(l_pred, l_tgt)
-    loss_r     = mse(r_pred, r_tgt)
-    loss_cdir  = bce(cdir_pred, cdir_tgt)
-    loss_btn   = bce(btn_pred,  btn_tgt)
+    loss_main = mse(main_pred, main_tgt)
+    loss_l    = mse(l_pred,    l_tgt)
+    loss_r    = mse(r_pred,    r_tgt)
+    loss_cdir = bce(cdir_pred, cdir_tgt)
+    loss_btn  = bce(btn_pred,  btn_tgt)
 
-    total = 10 * loss_main + loss_l + loss_r + loss_cdir + loss_btn
+    total = loss_main + loss_l + loss_r + loss_cdir + loss_btn
     return total, dict(
         loss_main=loss_main.item(),
-        loss_l=loss_l.item(),
-        loss_r=loss_r.item(),
+        loss_l   =loss_l.item(),
+        loss_r   =loss_r.item(),
         loss_cdir=loss_cdir.item(),
-        loss_btn=loss_btn.item(),
+        loss_btn =loss_btn.item(),
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,7 +86,7 @@ def get_dataloader(ds):
     return DataLoader(
         ds,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn,
         drop_last=True,
@@ -101,101 +99,63 @@ def get_model():
     return model, cfg
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Training loop
+# 5. Training loop with gradient debug + checkpointing
 # ─────────────────────────────────────────────────────────────────────────────
 def train():
-    ds        = get_dataset()
-    dl        = get_dataloader(ds)
-    model,cfg = get_model()
+    ds         = get_dataset()
+    dl         = get_dataloader(ds)
+    model, cfg = get_model()
+    optimiser  = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # split out pos_emb to train it more gently
-    pos_params   = [p for n,p in model.named_parameters() if n == "pos_emb"]
-    other_params = [p for n,p in model.named_parameters() if n != "pos_emb"]
-    optimiser = optim.Adam(
-        [
-            {"params": other_params, "lr": LEARNING_RATE},
-            {"params": pos_params,   "lr": LEARNING_RATE * 0.1},
-        ]
-    )
-
-    run = wandb.init(
-        project="FRAME",
-        entity="erickfm",
-        config=dict(
-            batch_size=BATCH_SIZE,
-            learning_rate=LEARNING_RATE,
-            epochs=NUM_EPOCHS,
-            num_workers=NUM_WORKERS,
-            sequence_length=SEQUENCE_LENGTH,
-            reaction_delay=REACTION_DELAY,
-            **cfg.__dict__,
-        ),
-    )
-
-    global_step = 0
+    print("Starting debug training: inspecting loss and grads on first batch")
     for epoch in range(1, NUM_EPOCHS + 1):
-        model.train()
-        epoch_loss, batch_ct = 0.0, 0
-
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
         for i, (state, target) in enumerate(dl, 1):
-            for k,v in state.items():
-                state[k] = v.to(DEVICE, non_blocking=True)
-            for k,v in target.items():
-                target[k] = v.to(DEVICE, non_blocking=True)
+            # Move data to device
+            for k, v in state.items():  state[k]  = v.to(DEVICE, non_blocking=True)
+            for k, v in target.items(): target[k] = v.to(DEVICE, non_blocking=True)
 
+            # Forward + compute loss
             preds, metrics = model(state), None
-            loss, metrics = compute_loss(preds, target)
+            loss, metrics  = compute_loss(preds, target)
 
+            # Print batch losses
+            print(
+                f"Batch {i:04d}: total={loss.item():.6f}, "
+                f"main={metrics['loss_main']:.4f}, l={metrics['loss_l']:.4f}, "
+                f"r={metrics['loss_r']:.4f}, cdir={metrics['loss_cdir']:.4f}, "
+                f"btn={metrics['loss_btn']:.4f}"
+            )
+
+            # Zero grads, backward, then debug‐print on first batch
             optimiser.zero_grad()
             loss.backward()
-            # ── clip gradients to prevent explosion
+            if epoch == 1 and i == 1:
+                print("=== GRADIENT STATS FOR FIRST BATCH ===")
+                for name, p in model.named_parameters():
+                    g = p.grad
+                    if g is None:
+                        print(f"{name:40s} | no grad")
+                    else:
+                        n_nan = int(torch.isnan(g).sum().item())
+                        n_inf = int(torch.isinf(g).sum().item())
+                        norm  = float(g.norm().item())
+                        print(f"{name:40s} | norm={norm:8.3f}  nan={n_nan:4d}  inf={n_inf:4d}")
+            # Clip & step
             nn_utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimiser.step()
 
-            # ── per-step logging
-            global_step += 1
-            wandb.log(
-                dict(step=global_step, loss=loss.item(), **metrics),
-                step=global_step,
-            )
-
-            epoch_loss += loss.item()
-            batch_ct   += 1
-            if i % 25 == 0:
-                print(
-                    f"[{i:04d}] total={loss.item():.4f} "
-                    f"main={metrics['loss_main']:.3f} "
-                    f"l={metrics['loss_l']:.3f} "
-                    f"r={metrics['loss_r']:.3f} "
-                    f"cdir={metrics['loss_cdir']:.3f} "
-                    f"btn={metrics['loss_btn']:.3f}"
-                )
-
-        avg_loss = epoch_loss / batch_ct
-        print(f"Epoch {epoch} done. Avg loss={avg_loss:.4f}")
-
-        # checkpoint
+        # checkpoint at end of epoch
         os.makedirs("checkpoints", exist_ok=True)
-        path = f"checkpoints/epoch_{epoch:02d}.pt"
-        torch.save(
-            dict(
-                epoch=epoch,
-                model_state_dict=model.state_dict(),
-                optimizer_state_dict=optimiser.state_dict(),
-                config=cfg.__dict__,
-            ),
-            path,
-        )
-        print("Saved checkpoint →", path)
+        ckpt_path = f"checkpoints/epoch_{epoch:02d}.pt"
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict":   model.state_dict(),
+            "optimizer_state_dict": optimiser.state_dict(),
+            "config": cfg.__dict__,
+        }, ckpt_path)
+        print(f"Saved checkpoint → {ckpt_path}")
 
-        # per-epoch log
-        wandb.log(dict(epoch=epoch, avg_loss=avg_loss), step=global_step)
-
-    run.finish()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Entrypoint
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     train()
+

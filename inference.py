@@ -1,39 +1,55 @@
 #!/usr/bin/env python3
-# inference.py
+# inference.py  –  FRAME bot (debug-enhanced)
 #
-# Real-time FRAME bot:
-#   • Converts live Slippi frames to dataset tensors
-#   • Encodes c-stick floats → 5-way categorical direction
-#   • Runs FramePredictor on a rolling window
-#   • Converts model output back to Dolphin controller actions
+# • Converts live Slippi frames to dataset tensors
+# • Encodes c-stick floats → 5-way categorical direction
+# • Runs FramePredictor on a rolling window
+# • Converts model output back to Dolphin controller actions
+# • Adds detailed sanity checks for NaNs, infs, dtypes & shapes
 # ---------------------------------------------------------------------------
 
+import argparse
+import logging
 import math
+import os
 import signal
 import sys
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List
 
+import melee
 import numpy as np
 import pandas as pd
 import torch
-import melee
 
-# ── maps & model ------------------------------------------------------------
+# ── CLI / logging ───────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="Realtime FRAME bot w/ debug")
+parser.add_argument("--debug", action="store_true", help="Verbose sanity checks")
+args = parser.parse_args()
+DEBUG = args.debug or bool(os.getenv("DEBUG", ""))
+
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format="%(asctime)s  [%(levelname)s]  %(message)s"
+)
+log = logging.getLogger(__name__)
+torch.set_printoptions(sci_mode=False, precision=4)
+
+# ── maps & model ────────────────────────────────────────────────────────────
 from cat_maps import STAGE_MAP, CHARACTER_MAP, ACTION_MAP, PROJECTILE_TYPE_MAP
-from model    import FramePredictor, ModelConfig
-from dataset  import MeleeFrameDatasetWithDelay  # only for feature spec
+from model     import FramePredictor, ModelConfig
+from dataset   import MeleeFrameDatasetWithDelay  # only for feature spec
 
 # ════════════════════════════════════════════════════════════════════════════
 # 0)  Device + checkpoint
 # ════════════════════════════════════════════════════════════════════════════
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", DEVICE)
+log.info("Device: %s", DEVICE)
 
 ckpts = sorted(Path("./checkpoints").glob("epoch_*.pt"))
 if not ckpts:
-    print("No checkpoints found."); sys.exit(1)
+    log.error("No checkpoints found."); sys.exit(1)
 ckpt_path = max(ckpts, key=lambda p: p.stat().st_mtime)
 ckpt      = torch.load(ckpt_path, map_location=DEVICE)
 cfg       = ModelConfig(**ckpt["config"])
@@ -41,7 +57,7 @@ cfg       = ModelConfig(**ckpt["config"])
 model = FramePredictor(cfg).to(DEVICE)
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
-print("Loaded", ckpt_path)
+log.info("Loaded checkpoint %s", ckpt_path)
 
 ROLL_WIN = cfg.max_seq_len
 MAX_PROJ = 8
@@ -64,7 +80,24 @@ _spec._enum_maps = {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
-# 2)  Helpers
+# 2)  Debug helpers
+# ════════════════════════════════════════════════════════════════════════════
+def check_tensor_dict(tdict: Dict[str, torch.Tensor], where: str) -> None:
+    """Warn if any NaN/Inf or unexpected dtype/shape sneaks in."""
+    if not DEBUG:
+        return
+    for k, v in tdict.items():
+        if torch.isnan(v).any() or torch.isinf(v).any():
+            log.warning("NaN/Inf detected in %s → %s", where, k)
+            bad_idx = torch.isnan(v) | torch.isinf(v)
+            log.debug("Offending values [%s]: %s", k, v[bad_idx][:10])
+        if v.device != DEVICE:
+            log.debug("Tensor %s not on %s (on %s instead)", k, DEVICE, v.device)
+        if v.dtype not in (torch.float32, torch.int64, torch.bool):
+            log.debug("Unexpected dtype in %s → %s (%s)", where, k, v.dtype)
+
+# ════════════════════════════════════════════════════════════════════════════
+# 3)  dataframe utils
 # ════════════════════════════════════════════════════════════════════════════
 def encode_cstick_dir_df(df: pd.DataFrame, prefix: str, dead: float = 0.15):
     dx = df[f"{prefix}_c_x"].astype(np.float32) - 0.5
@@ -97,41 +130,36 @@ def _map_cat(col: str, x: Any) -> int:
         return 0
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 3)  rows → state_seq
-# ════════════════════════════════════════════════════════════════════════════
 def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    """Convert rolling list of row dicts → tensor batch (B=1)."""
     df = pd.DataFrame(rows).drop(columns=["startAt"], errors="ignore")
 
-    # encode c_dirs before any mapping
+    # ---------- C-stick dirs ----------
     for p in ("self", "opp", "self_nana", "opp_nana"):
         if f"{p}_c_x" in df.columns:
             encode_cstick_dir_df(df, p)
 
-    # fill NaNs for numeric / bool
+    # ---------- Fill NaNs ----------
     num_cols  = [c for c, t in df.dtypes.items() if t.kind in ("i", "f")]
     bool_cols = [c for c, t in df.dtypes.items() if t == "bool"]
     df[num_cols]  = df[num_cols].fillna(0.0)
     df[bool_cols] = df[bool_cols].fillna(False)
 
-    # ------------------------------------------------------------------
-    # Guarantee ALL categorical columns exist – batch insert to avoid
-    # fragmentation warnings
-    # ------------------------------------------------------------------
+    # ---------- Ensure categorical columns ----------
     missing_cats = [c for c in _spec._categorical_cols if c not in df.columns]
     if missing_cats:
         df = pd.concat([df, pd.DataFrame({c: 0 for c in missing_cats},
                                          index=df.index)], axis=1)
 
-    # map categoricals
+    # ---------- Map categoricals ----------
     for col in _spec._categorical_cols:
         df[col] = df[col].map(lambda x, c=col: _map_cat(c, x)).astype("int64")
 
-    # synthetic Nana flags
+    # ---------- Synthetic Nana flags ----------
     df["self_nana_present"] = (df.get("self_nana_character", 0) > 0).astype("float32")
     df["opp_nana_present"]  = (df.get("opp_nana_character", 0) > 0).astype("float32")
 
-    # ensure numeric cols exist (batch insert)
+    # ---------- Ensure numeric columns ----------
     numeric_missing = {}
     for _, meta in _spec._walk_groups(return_meta=True):
         if meta["ftype"] != "categorical":
@@ -141,30 +169,46 @@ def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     if numeric_missing:
         df = pd.concat([df, pd.DataFrame(numeric_missing, index=df.index)], axis=1)
 
-    # build tensor dict
+    # Optional dataframe NaN audit
+    if DEBUG and df.isna().any().any():
+        bad = df.columns[df.isna().any()].tolist()
+        log.warning("DataFrame still has NaNs in cols: %s", bad)
+
+    # ---------- Build tensor dict ----------
     state_seq: Dict[str, torch.Tensor] = {}
     for _, meta in _spec._walk_groups(return_meta=True):
         cols, ftype, entity = meta["cols"], meta["ftype"], meta["entity"]
         key = f"{entity}_{ftype}" if entity != "global" else ftype
+
         if ftype == "categorical":
             for col in cols:
                 state_seq[col] = torch.from_numpy(df[col].values).long().unsqueeze(0)
         else:
             mats = [torch.from_numpy(df[c].astype(np.float32).values) for c in cols]
             state_seq[key] = (torch.stack(mats, -1) if len(mats) > 1 else mats[0]).unsqueeze(0)
+
+    if DEBUG:
+        check_tensor_dict(state_seq, "state_seq")
     return state_seq
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# 4)  Inference wrapper
+# ════════════════════════════════════════════════════════════════════════════
 @torch.no_grad()
 def run_inference(win_rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     batch = rows_to_state_seq(win_rows)
     for k, v in batch.items():
-        batch[k] = v.to(DEVICE)
+        batch[k] = v.to(DEVICE, non_blocking=True)
+
+    check_tensor_dict(batch, "batch_before_model")
     preds = model(batch)
+    check_tensor_dict(preds, "model_output")
+
     return {k: v.cpu().squeeze(0) for k, v in preds.items()}
 
 # ════════════════════════════════════════════════════════════════════════════
-# 4)  Controller output (with NaN-safe clamp)
+# 5)  Controller output (with NaN-safe clamp)
 # ════════════════════════════════════════════════════════════════════════════
 C_DIR_TO_FLOAT = {
     0: (0.5, 0.5),
@@ -180,9 +224,10 @@ def _safe(val: float, default: float = 0.5) -> float:
         return default
     return min(max(val, 0.0), 1.0)
 
+
 def press_output(ctrl: melee.Controller,
                  pred: Dict[str, torch.Tensor],
-                 thresh: float = 0.7):
+                 thresh: float = 0.5):
 
     mx, my = map(float, pred["main_xy"].tolist())
     mx, my = _safe(mx), _safe(my)
@@ -210,13 +255,13 @@ def press_output(ctrl: melee.Controller,
         (ctrl.press_button if prob.item() > thresh else ctrl.release_button)(btn)
 
 # ════════════════════════════════════════════════════════════════════════════
-# 5)  Dolphin loop
+# 6)  Dolphin loop
 # ════════════════════════════════════════════════════════════════════════════
 def signal_handler(sig, _):
     for c in controllers.values():
         c.disconnect()
     console.stop()
-    print("Shutting down…")
+    log.info("Shutting down…")
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -231,11 +276,11 @@ if __name__ == "__main__":
     console.run(iso_path=ISO_PATH)
 
     if not console.connect():
-        print("Console connect failed"); sys.exit(1)
+        log.error("Console connect failed"); sys.exit(1)
     for c in controllers.values():
         if not c.connect():
-            print("Controller connect failed"); sys.exit(1)
-    print("Console + controllers connected.")
+            log.error("Controller connect failed"); sys.exit(1)
+    log.info("Console + controllers connected.")
 
     rows: deque[Dict[str, Any]] = deque(maxlen=ROLL_WIN)
 
@@ -257,9 +302,7 @@ if __name__ == "__main__":
             )
             continue
 
-        # -------------------------------------------------------------------
-        # Build a single-row dict (mirrors dataset column names)
-        # -------------------------------------------------------------------
+        # ---------- build row ----------
         row: Dict[str, Any] = {}
         row["stage"]    = gs.stage.name if gs.stage else ""
         row["frame"]    = gs.frame
@@ -297,7 +340,7 @@ if __name__ == "__main__":
                 row[f"{npref}action"]       = ""
                 row[f"{npref}action_frame"] = -1
 
-        # projectiles
+        # ---------- projectiles ----------
         for j in range(MAX_PROJ):
             pp = f"proj{j}_"
             if j < len(gs.projectiles):
@@ -320,6 +363,7 @@ if __name__ == "__main__":
                 row[f"{pp}speed_y"] = np.nan
                 row[f"{pp}frame"]   = -1
 
+        # ---------- inference ----------
         rows.append(row)
         if len(rows) == ROLL_WIN:
             pred = run_inference(list(rows))
@@ -329,6 +373,10 @@ if __name__ == "__main__":
             ctrl.flush()
 
             if gs.frame % 60 == 0:
-                print(f"[{gs.frame}] main={pred['main_xy'].tolist()} "
-                      f"cdir={int(torch.argmax(pred['c_dir_logits']))} "
-                      f"btn0-3={pred['btn_probs'][:4].tolist()}")
+                log.info(
+                    "[%d] main=%s cdir=%d btn0-3=%s",
+                    gs.frame,
+                    pred["main_xy"].tolist(),
+                    int(torch.argmax(pred["c_dir_logits"])),
+                    pred["btn_probs"][:4].tolist()
+                )
