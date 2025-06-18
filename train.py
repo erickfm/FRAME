@@ -26,14 +26,17 @@ REACTION_DELAY  = 1
 DATA_DIR        = "./data"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Collate
+# 2. Collate (with NaN/Inf clamp)
 # ─────────────────────────────────────────────────────────────────────────────
 def collate_fn(batch):
     batch_state, batch_target = {}, {}
     for k in batch[0][0]:
-        batch_state[k] = torch.stack([item[0][k] for item in batch], 0)
+        x = torch.stack([item[0][k] for item in batch], 0)
+        # replace NaN→0, +/-Inf→large finite
+        batch_state[k] = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
     for k in batch[0][1]:
-        batch_target[k] = torch.stack([item[1][k] for item in batch], 0)
+        y = torch.stack([item[1][k] for item in batch], 0)
+        batch_target[k] = torch.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
     return batch_state, batch_target
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +114,11 @@ def train():
     dl = get_dataloader(ds)
     model, cfg = get_model()
 
-    optimiser = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimiser = optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=1e-5,      # helps stabilize weights
+    )
 
     wandb.init(
         project="FRAME",
@@ -134,16 +141,22 @@ def train():
 
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
         for i, (state, target) in enumerate(dl, 1):
+            # move to device
             for k, v in state.items():
                 state[k] = v.to(DEVICE, non_blocking=True)
             for k, v in target.items():
                 target[k] = v.to(DEVICE, non_blocking=True)
 
+            # forward
             preds = model(state)
-            loss, metrics = compute_loss(preds, target)
+            # clamp any NaNs/Infs in outputs
+            for k, v in preds.items():
+                preds[k] = torch.nan_to_num(v, nan=0.0, posinf=1e6, neginf=-1e6)
 
+            # optional: debug first batch gradients
             if i == 1 and epoch == 1:
-                grads = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
+                loss_tmp, _ = compute_loss(preds, target)
+                grads = torch.autograd.grad(loss_tmp, model.parameters(), retain_graph=True)
                 print("=== GRADIENT STATS FOR FIRST BATCH ===")
                 for (name, p), g in zip(model.named_parameters(), grads):
                     if g is None:
@@ -154,11 +167,14 @@ def train():
                         norm = float(g.norm().item())
                         print(f"{name:40s} | norm={norm:8.3f}  nan={n_nan:4d}  inf={n_inf:4d}")
 
+            # loss + backward
+            loss, metrics = compute_loss(preds, target)
             optimiser.zero_grad()
             loss.backward()
             nn_utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimiser.step()
 
+            # logging
             global_step += 1
             wandb.log(dict(step=global_step, loss=loss.item(), **metrics), step=global_step)
 
@@ -175,6 +191,7 @@ def train():
                     f"btn={metrics['loss_btn']:.3f}"
                 )
 
+        # end epoch
         avg_loss = epoch_loss / max(batch_ct, 1)
         print(f"Epoch {epoch} done. Avg loss={avg_loss:.4f}")
 
