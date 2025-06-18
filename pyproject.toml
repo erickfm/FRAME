@@ -13,6 +13,7 @@ pandas = "*"
 pyarrow = "*"
 melee = "*"
 typing-extensions = "*"
+wandb = "^0.20.1"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
