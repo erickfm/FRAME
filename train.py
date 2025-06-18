@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train.py  —  Debug training with loss + gradient inspection
+# train.py  —  Debug training with loss + gradient inspection + checkpointing
 
 import os
 import torch
@@ -7,18 +7,15 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.utils as nn_utils
 from torch.utils.data import DataLoader
+import wandb
 
 from dataset import MeleeFrameDatasetWithDelay
-from model   import FramePredictor, ModelConfig
+from model import FramePredictor, ModelConfig
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Config
 # ─────────────────────────────────────────────────────────────────────────────
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available()
-    else "cpu"  if torch.backends.mps.is_available()
-    else "cpu"
-)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE      = 128
 NUM_EPOCHS      = 10
@@ -40,8 +37,14 @@ def collate_fn(batch):
     return batch_state, batch_target
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Loss (raw sum) + metrics
+# 3. Loss (with per-term safety)
 # ─────────────────────────────────────────────────────────────────────────────
+def safe_loss(fn, pred, tgt, name):
+    out = fn(pred, tgt)
+    if not torch.isfinite(out):
+        raise RuntimeError(f"❌ {name} produced non-finite value: {out}")
+    return out
+
 def compute_loss(preds, targets):
     mse, bce = nn.MSELoss(), nn.BCEWithLogitsLoss()
 
@@ -57,19 +60,19 @@ def compute_loss(preds, targets):
     cdir_tgt  = targets["c_dir"]
     btn_tgt   = targets.get("btns", targets.get("btns_float")).float()
 
-    loss_main = mse(main_pred, main_tgt)
-    loss_l    = mse(l_pred,    l_tgt)
-    loss_r    = mse(r_pred,    r_tgt)
-    loss_cdir = bce(cdir_pred, cdir_tgt)
-    loss_btn  = bce(btn_pred,  btn_tgt)
+    loss_main = safe_loss(mse,  main_pred, main_tgt, "main_xy")
+    loss_l    = safe_loss(mse,  l_pred,    l_tgt,    "L_val")
+    loss_r    = safe_loss(mse,  r_pred,    r_tgt,    "R_val")
+    loss_cdir = safe_loss(bce,  cdir_pred, cdir_tgt, "c_dir")
+    loss_btn  = safe_loss(bce,  btn_pred,  btn_tgt,  "btns")
 
     total = loss_main + loss_l + loss_r + loss_cdir + loss_btn
     return total, dict(
         loss_main=loss_main.item(),
-        loss_l   =loss_l.item(),
-        loss_r   =loss_r.item(),
+        loss_l=loss_l.item(),
+        loss_r=loss_r.item(),
         loss_cdir=loss_cdir.item(),
-        loss_btn =loss_btn.item(),
+        loss_btn=loss_btn.item(),
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +89,7 @@ def get_dataloader(ds):
     return DataLoader(
         ds,
         batch_size=BATCH_SIZE,
-        shuffle=False,
+        shuffle=True,
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn,
         drop_last=True,
@@ -94,68 +97,100 @@ def get_dataloader(ds):
     )
 
 def get_model():
-    cfg   = ModelConfig(max_seq_len=SEQUENCE_LENGTH)
+    cfg = ModelConfig(max_seq_len=SEQUENCE_LENGTH)
     model = FramePredictor(cfg).to(DEVICE)
     return model, cfg
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Training loop with gradient debug + checkpointing
+# 5. Training loop with detailed logging and checkpointing
 # ─────────────────────────────────────────────────────────────────────────────
 def train():
-    ds         = get_dataset()
-    dl         = get_dataloader(ds)
-    model, cfg = get_model()
-    optimiser  = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    torch.autograd.set_detect_anomaly(True)
 
-    print("Starting debug training: inspecting loss and grads on first batch")
+    ds = get_dataset()
+    dl = get_dataloader(ds)
+    model, cfg = get_model()
+
+    optimiser = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    wandb.init(
+        project="FRAME",
+        entity="erickfm",
+        config=dict(
+            batch_size=BATCH_SIZE,
+            learning_rate=LEARNING_RATE,
+            epochs=NUM_EPOCHS,
+            num_workers=NUM_WORKERS,
+            sequence_length=SEQUENCE_LENGTH,
+            reaction_delay=REACTION_DELAY,
+            **cfg.__dict__,
+        ),
+    )
+
+    global_step = 0
     for epoch in range(1, NUM_EPOCHS + 1):
+        model.train()
+        epoch_loss, batch_ct = 0.0, 0
+
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
         for i, (state, target) in enumerate(dl, 1):
-            # Move data to device
-            for k, v in state.items():  state[k]  = v.to(DEVICE, non_blocking=True)
-            for k, v in target.items(): target[k] = v.to(DEVICE, non_blocking=True)
+            for k, v in state.items():
+                state[k] = v.to(DEVICE, non_blocking=True)
+            for k, v in target.items():
+                target[k] = v.to(DEVICE, non_blocking=True)
 
-            # Forward + compute loss
-            preds, metrics = model(state), None
-            loss, metrics  = compute_loss(preds, target)
+            preds = model(state)
+            loss, metrics = compute_loss(preds, target)
 
-            # Print batch losses
-            print(
-                f"Batch {i:04d}: total={loss.item():.6f}, "
-                f"main={metrics['loss_main']:.4f}, l={metrics['loss_l']:.4f}, "
-                f"r={metrics['loss_r']:.4f}, cdir={metrics['loss_cdir']:.4f}, "
-                f"btn={metrics['loss_btn']:.4f}"
-            )
-
-            # Zero grads, backward, then debug‐print on first batch
-            optimiser.zero_grad()
-            loss.backward()
-            if epoch == 1 and i == 1:
+            if i == 1 and epoch == 1:
+                grads = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
                 print("=== GRADIENT STATS FOR FIRST BATCH ===")
-                for name, p in model.named_parameters():
-                    g = p.grad
+                for (name, p), g in zip(model.named_parameters(), grads):
                     if g is None:
                         print(f"{name:40s} | no grad")
                     else:
                         n_nan = int(torch.isnan(g).sum().item())
                         n_inf = int(torch.isinf(g).sum().item())
-                        norm  = float(g.norm().item())
+                        norm = float(g.norm().item())
                         print(f"{name:40s} | norm={norm:8.3f}  nan={n_nan:4d}  inf={n_inf:4d}")
-            # Clip & step
+
+            optimiser.zero_grad()
+            loss.backward()
             nn_utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimiser.step()
 
-        # checkpoint at end of epoch
+            global_step += 1
+            wandb.log(dict(step=global_step, loss=loss.item(), **metrics), step=global_step)
+
+            epoch_loss += loss.item()
+            batch_ct += 1
+
+            if i % 25 == 0:
+                print(
+                    f"[{i:04d}] total={loss.item():.4f} "
+                    f"main={metrics['loss_main']:.3f} "
+                    f"l={metrics['loss_l']:.3f} "
+                    f"r={metrics['loss_r']:.3f} "
+                    f"cdir={metrics['loss_cdir']:.3f} "
+                    f"btn={metrics['loss_btn']:.3f}"
+                )
+
+        avg_loss = epoch_loss / max(batch_ct, 1)
+        print(f"Epoch {epoch} done. Avg loss={avg_loss:.4f}")
+
         os.makedirs("checkpoints", exist_ok=True)
-        ckpt_path = f"checkpoints/epoch_{epoch:02d}.pt"
+        path = f"checkpoints/epoch_{epoch:02d}.pt"
         torch.save({
-            "epoch": epoch,
-            "model_state_dict":   model.state_dict(),
-            "optimizer_state_dict": optimiser.state_dict(),
-            "config": cfg.__dict__,
-        }, ckpt_path)
-        print(f"Saved checkpoint → {ckpt_path}")
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimiser.state_dict(),
+            'config': cfg.__dict__,
+        }, path)
+        print("Saved checkpoint →", path)
+
+        wandb.log(dict(epoch=epoch, avg_loss=avg_loss), step=global_step)
+
+    wandb.finish()
 
 if __name__ == "__main__":
     train()
-
