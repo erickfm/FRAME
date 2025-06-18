@@ -298,7 +298,7 @@ if __name__ == "__main__":
             )
             melee.MenuHelper().menu_helper_simple(
                 gs, c1, melee.Character.FALCO, melee.Stage.POKEMON_STADIUM,
-                cpu_level=1, autostart=1
+                cpu_level=0, autostart=1
             )
             continue
 
