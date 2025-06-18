@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# train.py  —  Debug training with loss + gradient inspection + checkpointing
+# train.py  —  FRAME training with strict finiteness checks
 
 import os
 import torch
@@ -20,23 +20,20 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE      = 512
 NUM_EPOCHS      = 10
 LEARNING_RATE   = 3e-4
-NUM_WORKERS     = 8
+NUM_WORKERS     = 4
 SEQUENCE_LENGTH = 30
 REACTION_DELAY  = 1
 DATA_DIR        = "./data"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Collate (with NaN/Inf clamp)
+# 2. Collate
 # ─────────────────────────────────────────────────────────────────────────────
 def collate_fn(batch):
     batch_state, batch_target = {}, {}
     for k in batch[0][0]:
-        x = torch.stack([item[0][k] for item in batch], 0)
-        # replace NaN→0, +/-Inf→large finite
-        batch_state[k] = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        batch_state[k] = torch.stack([item[0][k] for item in batch], 0)
     for k in batch[0][1]:
-        y = torch.stack([item[1][k] for item in batch], 0)
-        batch_target[k] = torch.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
+        batch_target[k] = torch.stack([item[1][k] for item in batch], 0)
     return batch_state, batch_target
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,20 +102,17 @@ def get_model():
     return model, cfg
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Training loop with detailed logging and checkpointing
+# 5. Training loop with sanity checks, anomaly detection, and checkpointing
 # ─────────────────────────────────────────────────────────────────────────────
 def train():
+    # will raise a stack-trace on first NaN during backward
     torch.autograd.set_detect_anomaly(True)
 
     ds = get_dataset()
     dl = get_dataloader(ds)
     model, cfg = get_model()
 
-    optimiser = optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=1e-5,      # helps stabilize weights
-    )
+    optimiser = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     wandb.init(
         project="FRAME",
@@ -141,40 +135,51 @@ def train():
 
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
         for i, (state, target) in enumerate(dl, 1):
-            # move to device
+            # ─── move to device ───────────────────────────────────────
             for k, v in state.items():
                 state[k] = v.to(DEVICE, non_blocking=True)
             for k, v in target.items():
                 target[k] = v.to(DEVICE, non_blocking=True)
 
-            # forward
-            preds = model(state)
-            # clamp any NaNs/Infs in outputs
-            for k, v in preds.items():
-                preds[k] = torch.nan_to_num(v, nan=0.0, posinf=1e6, neginf=-1e6)
+            # ─── sanity-check inputs ────────────────────────────────────
+            for name, tensor in state.items():
+                if not torch.isfinite(tensor).all():
+                    raise RuntimeError(f"Non-finite values in state['{name}'] before forward")
+            for name, tensor in target.items():
+                if not torch.isfinite(tensor).all():
+                    raise RuntimeError(f"Non-finite values in target['{name}'] before forward")
 
-            # optional: debug first batch gradients
-            if i == 1 and epoch == 1:
-                loss_tmp, _ = compute_loss(preds, target)
-                grads = torch.autograd.grad(loss_tmp, model.parameters(), retain_graph=True)
-                print("=== GRADIENT STATS FOR FIRST BATCH ===")
-                for (name, p), g in zip(model.named_parameters(), grads):
-                    if g is None:
-                        print(f"{name:40s} | no grad")
-                    else:
-                        n_nan = int(torch.isnan(g).sum().item())
-                        n_inf = int(torch.isinf(g).sum().item())
-                        norm = float(g.norm().item())
-                        print(f"{name:40s} | norm={norm:8.3f}  nan={n_nan:4d}  inf={n_inf:4d}")
+            # ─── forward, output-check, loss ───────────────────────────
+            with torch.autograd.detect_anomaly():
+                preds = model(state)
 
-            # loss + backward
-            loss, metrics = compute_loss(preds, target)
+                # ─── sanity-check outputs ───────────────────────────
+                for name, tensor in preds.items():
+                    if not torch.isfinite(tensor).all():
+                        raise RuntimeError(f"Non-finite values in model output '{name}' after forward")
+
+                loss, metrics = compute_loss(preds, target)
+
+                # ─── gradient stats for first batch ────────────────────
+                if i == 1 and epoch == 1:
+                    grads = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
+                    print("=== GRADIENT STATS FOR FIRST BATCH ===")
+                    for (pname, p), g in zip(model.named_parameters(), grads):
+                        if g is None:
+                            print(f"{pname:40s} | no grad")
+                        else:
+                            n_nan = int(torch.isnan(g).sum().item())
+                            n_inf = int(torch.isinf(g).sum().item())
+                            norm = float(g.norm().item())
+                            print(f"{pname:40s} | norm={norm:8.3f}  nan={n_nan:4d}  inf={n_inf:4d}")
+
+            # ─── backward & step ───────────────────────────────────────
             optimiser.zero_grad()
             loss.backward()
             nn_utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimiser.step()
 
-            # logging
+            # ─── logging ───────────────────────────────────────────────
             global_step += 1
             wandb.log(dict(step=global_step, loss=loss.item(), **metrics), step=global_step)
 
@@ -191,7 +196,7 @@ def train():
                     f"btn={metrics['loss_btn']:.3f}"
                 )
 
-        # end epoch
+        # ─── end epoch: checkpoint & report ───────────────────────────
         avg_loss = epoch_loss / max(batch_ct, 1)
         print(f"Epoch {epoch} done. Avg loss={avg_loss:.4f}")
 

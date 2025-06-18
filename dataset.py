@@ -1,7 +1,7 @@
 # dataset.py
 # -------------------------------------------------------------------------
 # Slippi parquet → fixed-length windows for FRAME
-# Adds hard NaN / range checks so the model can’t corrupt its weights.
+# Ensures no NaNs or Infs in any numeric feature (including distance)
 # -------------------------------------------------------------------------
 
 from pathlib import Path
@@ -28,18 +28,14 @@ BTN = [
     "BUTTON_D_UP", "BUTTON_D_DOWN", "BUTTON_D_LEFT", "BUTTON_D_RIGHT",
 ]
 
-
 def btn_cols(prefix: str) -> List[str]:
     return [f"{prefix}_btn_{b}" for b in BTN]
 
-
 def analog_cols(prefix: str) -> List[str]:
-    # main stick + shoulders (c-stick is handled by categorical self_*_c_dir)
     return [
         f"{prefix}_main_x", f"{prefix}_main_y",
         f"{prefix}_l_shldr", f"{prefix}_r_shldr",
     ]
-
 
 def numeric_state(prefix: str) -> List[str]:
     base = [
@@ -59,14 +55,12 @@ def numeric_state(prefix: str) -> List[str]:
     ]
     return base + ecb
 
-
 def flags(prefix: str) -> List[str]:
     return [
         f"{prefix}_on_ground", f"{prefix}_off_stage",
         f"{prefix}_facing", f"{prefix}_invulnerable",
         f"{prefix}_moonwalkwarning",
     ]
-
 
 def categorical_ids(prefix: str) -> List[str]:
     return [
@@ -76,7 +70,6 @@ def categorical_ids(prefix: str) -> List[str]:
         f"{prefix}_costume",
     ]
 
-
 # -----------------------------------------------------------------------------
 # C-stick direction encoding
 # -----------------------------------------------------------------------------
@@ -85,10 +78,6 @@ def encode_cstick_dir(
     prefix: str,
     dead_zone: float = 0.15,
 ) -> str:
-    """
-    Produce <prefix>_c_dir with 5 classes:
-      0 = neutral   1 = up   2 = down   3 = left   4 = right
-    """
     dx = df[f"{prefix}_c_x"].astype("float32") - 0.5
     dy = 0.5 - df[f"{prefix}_c_y"].astype("float32")   # invert so up = +Y
 
@@ -108,7 +97,6 @@ def encode_cstick_dir(
     df[new_col] = cat
     return new_col
 
-
 # -----------------------------------------------------------------------------
 # Dataset
 # -----------------------------------------------------------------------------
@@ -124,9 +112,6 @@ class MeleeFrameDatasetWithDelay(Dataset):
         "randall_height", "randall_left", "randall_right",
     ]
 
-    # ---------------------------------------------------------------------
-    # Init
-    # ---------------------------------------------------------------------
     def __init__(
         self,
         parquet_dir: str,
@@ -160,10 +145,10 @@ class MeleeFrameDatasetWithDelay(Dataset):
             if meta["ftype"] == "categorical":
                 self._categorical_cols.extend(meta["cols"])
 
-        # Build dynamic categorical maps (ports, subtypes, etc.)
+        # Build dynamic categorical maps
         self._build_categorical_mappings()
 
-        # Enum-based maps are fixed and centralised
+        # Fixed enum maps
         self._enum_maps: Dict[str, Dict[int, int]] = {
             "stage": STAGE_MAP,
             "_character": CHARACTER_MAP,
@@ -172,9 +157,6 @@ class MeleeFrameDatasetWithDelay(Dataset):
             "c_dir":      {i: i for i in range(5)},
         }
 
-    # ---------------------------------------------------------------------
-    # Internal helpers
-    # ---------------------------------------------------------------------
     def _get_enum_map(self, col: str) -> Dict[int, int]:
         if col == "stage":
             return self._enum_maps["stage"]
@@ -185,9 +167,6 @@ class MeleeFrameDatasetWithDelay(Dataset):
                 return m
         return getattr(self, f"{col}_map")
 
-    # ---------------------------------------------------------------------
-    # Build feature tree
-    # ---------------------------------------------------------------------
     def _build_feature_groups(self) -> Dict[str, Dict]:
         fg: Dict[str, Dict] = {
             "global": {
@@ -256,18 +235,12 @@ class MeleeFrameDatasetWithDelay(Dataset):
         }
         return fg
 
-    # ---------------------------------------------------------------------
-    # DFS utility over the feature tree
-    # ---------------------------------------------------------------------
     def _walk_groups(self, *, return_meta=False):
         stack = [((), self.feature_groups)]
         while stack:
             prefix, node = stack.pop()
             if isinstance(node, dict) and all(
-                k in (
-                    "numeric", "categorical", "buttons", "flags",
-                    "analog", "action_elapsed"
-                )
+                k in ("numeric", "categorical", "buttons", "flags", "analog", "action_elapsed")
                 for k in node
             ):
                 for ftype, cols in node.items():
@@ -285,9 +258,6 @@ class MeleeFrameDatasetWithDelay(Dataset):
                 for k, sub in node.items():
                     stack.append(((*prefix, k), sub))
 
-    # ---------------------------------------------------------------------
-    # Build dynamic maps (ports, projectile subtypes…)
-    # ---------------------------------------------------------------------
     def _build_categorical_mappings(self):
         raw_unique = {
             c: set()
@@ -298,25 +268,19 @@ class MeleeFrameDatasetWithDelay(Dataset):
             and not c.endswith("_type")
             and not c.endswith("_c_dir")
         }
-
         for fpath in self.files:
             df = pd.read_parquet(fpath)
             df = df[df["frame"] >= 0]
             for c in list(raw_unique):
                 if c in df.columns:
                     vals = df[c].dropna().astype("int64")
-                    # Clamp to 0–4 for ports / owners; ignore negatives
                     raw_unique[c].update(v for v in vals if 0 <= v <= 4)
-
         for c, s in raw_unique.items():
             vals = sorted(s)
             if 0 not in vals:
                 vals.insert(0, 0)
             setattr(self, f"{c}_map", {raw: idx for idx, raw in enumerate(vals)})
 
-    # ---------------------------------------------------------------------
-    # Dataset interface
-    # ---------------------------------------------------------------------
     def __len__(self):
         return len(self.index_map)
 
@@ -327,44 +291,61 @@ class MeleeFrameDatasetWithDelay(Dataset):
         df = pd.read_parquet(fpath)
         df = df[df["frame"] >= 0].reset_index(drop=True)
 
-        # ---- Encode c-stick direction before mapping
+        # ---- Encode c-stick direction
         for p in ("self", "opp", "self_nana", "opp_nana"):
             encode_cstick_dir(df, p, dead_zone=0.15)
 
-        # ---- Drop unused & fill blanks
+        # ---- Drop unused & basic fillna
         df = df.drop(columns=["startAt"], errors="ignore")
 
+        # ---- Recompute distance explicitly
+        df["distance"] = np.hypot(
+            df["self_main_x"] - df["opp_main_x"],
+            df["self_main_y"] - df["opp_main_y"],
+        ).astype("float32")
+
+        # ---- Fill defaults
         num_cols  = [c for c, dt in df.dtypes.items() if dt.kind in ("i", "f")]
         bool_cols = [c for c, dt in df.dtypes.items() if dt == "bool"]
         df[num_cols]  = df[num_cols].fillna(0.0)
         df[bool_cols] = df[bool_cols].fillna(False)
 
-        # ---- Map categoricals → contiguous ids
+        # ---- Clamp only the exact numeric-features subset, with dtype coercion
+        numeric_cols = []
+        for _, meta in self._walk_groups(return_meta=True):
+            if meta["ftype"] == "numeric":
+                numeric_cols.extend(meta["cols"])
+        numeric_cols = [c for c in set(numeric_cols) if c in df.columns]
+
+        # **Fix**: cast to float32 before isfinite
+        arr = df[numeric_cols].astype(np.float32).to_numpy()
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            arr[mask] = 0.0
+            df.loc[:, numeric_cols] = arr
+
+        # ---- Map categoricals → ids (with guards) ----
         for c in self._categorical_cols:
             raw = df[c].fillna(0)
             df[c] = raw.map(lambda x: self._get_enum_map(c).get(x, 0)).astype("int64")
-
-            # Guard: any NaN after mapping means we missed a value
             if df[c].isna().any():
                 bad = df.loc[df[c].isna(), c][:10].tolist()
-                raise ValueError(f"{c}: unmapped values produced NaN → {bad}")
-
-            # Guard: index must be < vocab size
+                raise ValueError(f"{c}: unmapped values → {bad}")
             vocab_size = max(self._get_enum_map(c).values()) + 1
             if (df[c] >= vocab_size).any():
                 max_bad = int(df[c].max())
                 raise ValueError(f"{c}: index {max_bad} ≥ vocab {vocab_size}")
 
-        # ---- Synthetic Nana presence flags
+        # ---- Synthetic Nana presence flags ----
         df = df.assign(
             self_nana_present=(df.get("self_nana_character", 0) > 0).astype("float32"),
             opp_nana_present =(df.get("opp_nana_character", 0) > 0).astype("float32"),
         )
 
-        # ---- Final NaN / Inf sweep over numeric data
-        if not np.isfinite(df[num_cols].to_numpy()).all():
-            bad_cols = df.columns[~np.isfinite(df[num_cols]).all()].tolist()
-            raise ValueError(f"Non-finite numeric values in: {bad_cols[:5]}")
+        # ---- Final guard (reuses arr, so no dtype issue) ----
+        if not np.isfinite(arr).all():
+            bad = [numeric_cols[i] for i in np.where(~np.isfinite(arr).any(axis=0))[0]]
+            raise ValueError(f"Non-finite still in numeric: {bad[:5]}")
 
         # -----------------------------------------------------------------
         # Slice window + target
