@@ -35,3 +35,11 @@ FRAME is a decoder-only transformer model for predicting next-frame inputs in Su
 ├── checkpoints/      # Saved *.pt files
 └── data/             # Place Slippi parquet files here
 ```
+
+## Setup
+
+Install dependencies using [Poetry](https://python-poetry.org/):
+
+```bash
+poetry install
+```
