@@ -293,11 +293,11 @@ if __name__ == "__main__":
         if gs.menu_state not in (melee.Menu.IN_GAME, melee.Menu.SUDDEN_DEATH):
             c0, c1 = controllers[ports[0]], controllers[ports[1]]
             melee.MenuHelper().menu_helper_simple(
-                gs, c0, melee.Character.FALCO, melee.Stage.POKEMON_STADIUM,
+                gs, c0, melee.Character.FALCO, melee.Stage.FINAL_DESTINATION,
                 cpu_level=0, autostart=0
             )
             melee.MenuHelper().menu_helper_simple(
-                gs, c1, melee.Character.FALCO, melee.Stage.POKEMON_STADIUM,
+                gs, c1, melee.Character.FALCO, melee.Stage.FINAL_DESTINATION,
                 cpu_level=0, autostart=1
             )
             continue
