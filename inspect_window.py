@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-# inspect_window.py — Audit FRAME sample windows for key features
+# inspect_window.py — Audit FRAME windows for key features: positions, stocks, distance, self analog, C-stick, buttons and targets
 
 import argparse
 from dataset import MeleeFrameDatasetWithDelay
 
 def main():
     p = argparse.ArgumentParser(
-        description="Inspect key features (frame, chars, actions, x/y, stocks, distance) for a sample window."
+        description=(
+            "Inspect input features (frame, chars, actions, positions, stocks, distance, "
+            "self analog, C-stick, buttons) and prediction targets for a dataset window."
+        )
     )
     p.add_argument("-i", "--index", type=int, default=0,
                    help="Sample index (0-based)")
@@ -25,44 +28,61 @@ def main():
         reaction_delay=args.delay,
     )
 
-    state, _ = ds[args.index]
+    # get state window and target
+    state, target = ds[args.index]
 
-    # extract tensors
-    global_num = state["numeric"]       # [T, 20]
-    self_num   = state["self_numeric"]  # [T, 22]
-    opp_num    = state["opp_numeric"]   # [T, 22]
-    self_char  = state["self_character"]
-    opp_char   = state["opp_character"]
-    self_act   = state["self_action"]
-    opp_act    = state["opp_action"]
+    # extract core tensors
+    num = state["numeric"]          # [T,20]
+    self_num = state["self_numeric"]  # [T,22]
+    opp_num  = state["opp_numeric"]   # [T,22]
+    sc = state["self_character"]
+    oc = state["opp_character"]
+    sa = state["self_action"]
+    oa = state["opp_action"]
+    analog = state["self_analog"]     # [T,4]
+    cstick = state["self_c_dir"]      # [T]
+    btns = state["self_buttons"].float()  # [T,12]
 
-    # deduced indices (cast frames to int to avoid format errors)
-    frames     = [int(x) for x in global_num[:, 1].tolist()]
-    distance   = global_num[:, 0].tolist()
-    self_x     = self_num[:, 0].tolist()
-    self_y     = self_num[:, 1].tolist()
-    opp_x      = opp_num[:, 0].tolist()
-    opp_y      = opp_num[:, 1].tolist()
-    self_stock = self_num[:, 3].tolist()
-    opp_stock  = opp_num[:, 3].tolist()
+    # build lists
+    T = num.shape[0]
+    frames = [int(f) for f in num[:,1].tolist()]
+    dist   = num[:,0].tolist()
+    sx = self_num[:,0].tolist(); sy = self_num[:,1].tolist()
+    ox = opp_num[:,0].tolist(); oy = opp_num[:,1].tolist()
+    ss = self_num[:,3].tolist(); os_ = opp_num[:,3].tolist()
+    ax = analog[:,0].tolist(); ay = analog[:,1].tolist()
+    al = analog[:,2].tolist(); ar = analog[:,3].tolist()
+    cd = cstick.tolist()
+    b  = btns.tolist()  # list of 12-length lists
 
-    # print header
+    # header
     header = (
-        "T  frame  self_char  opp_char  self_act  opp_act  "
-        "self_x  self_y  opp_x  opp_y  self_stock  opp_stock  distance"
+        "T frame self_char opp_char self_act opp_act self_x self_y opp_x opp_y "
+        "self_stock opp_stock distance analog_x analog_y analog_L analog_R C_dir buttons"
     )
     print(header)
 
-    # print each timestep
-    for t in range(len(frames)):
+    # rows
+    for t in range(T):
         print(
-            f"{t:2d} {frames[t]:6d} {self_char[t]:11d} {opp_char[t]:9d} "
-            f"{self_act[t]:9d} {opp_act[t]:8d} "
-            f"{self_x[t]:7.3f} {self_y[t]:7.3f} "
-            f"{opp_x[t]:7.3f} {opp_y[t]:7.3f} "
-            f"{self_stock[t]:10.1f} {opp_stock[t]:10.1f} "
-            f"{distance[t]:8.3f}"
+            f"{t:2d} {frames[t]:5d} {sc[t]:9d} {oc[t]:8d} {sa[t]:8d} {oa[t]:8d} "
+            f"{sx[t]:7.3f} {sy[t]:7.3f} {ox[t]:7.3f} {oy[t]:7.3f} "
+            f"{ss[t]:10.1f} {os_[t]:10.1f} {dist[t]:9.3f} "
+            f"{ax[t]:8.3f} {ay[t]:8.3f} {al[t]:8.3f} {ar[t]:8.3f} "
+            f"{cd[t]:2d} {b[t]}"
         )
+
+    # prediction targets
+    tf = frames[-1] + args.delay
+    print(f"\nTargets (frame {tf}):")
+    print(f"  main_x  = {target['main_x'].item():.3f}")
+    print(f"  main_y  = {target['main_y'].item():.3f}")
+    print(f"  l_shldr = {target['l_shldr'].item():.3f}")
+    print(f"  r_shldr = {target['r_shldr'].item():.3f}")
+    cv = target['c_dir'].tolist(); ci = cv.index(max(cv))
+    print(f"  c_dir   = {cv} (idx {ci})")
+    bv = target['btns'].tolist()
+    print(f"  btns    = {bv}")
 
 if __name__ == "__main__":
     main()
