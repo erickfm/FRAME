@@ -298,10 +298,10 @@ class MeleeFrameDatasetWithDelay(Dataset):
         # ---- Drop unused & basic fillna
         df = df.drop(columns=["startAt"], errors="ignore")
 
-        # ---- Recompute distance explicitly
+        # ---- Recompute distance explicitly (using true on‐stage positions)
         df["distance"] = np.hypot(
-            df["self_main_x"] - df["opp_main_x"],
-            df["self_main_y"] - df["opp_main_y"],
+            df["self_pos_x"] - df["opp_pos_x"],
+            df["self_pos_y"] - df["opp_pos_y"],
         ).astype("float32")
 
         # ---- Fill defaults
