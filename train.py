@@ -90,7 +90,7 @@ def get_dataloader(ds):
     return DataLoader(
         ds,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        shuffle=False,
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn,
         drop_last=True,

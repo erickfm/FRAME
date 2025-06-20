@@ -33,7 +33,7 @@ class ModelConfig:
     nhead: int           = 8       # d_model must be divisible by nhead
     num_layers: int      = 4       # was 4
     dim_feedforward: int = 1024     # was 1024
-    dropout: float       = 0.1     # turn off dropout to help overfit
+    dropout: float       = 0.0     # turn off dropout to help overfit
 
     # sequence length
     max_seq_len: int     = 60      # was 120

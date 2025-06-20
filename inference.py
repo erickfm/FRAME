@@ -378,7 +378,7 @@ if __name__ == "__main__":
         rows.append(row)
         if len(rows) == ROLL_WIN:
             start_wait+=1
-            if start_wait>90:
+            if start_wait>10:
                 pred = run_inference(list(rows))
                 ctrl = controllers[ports[0]]
                 ctrl.release_all()
