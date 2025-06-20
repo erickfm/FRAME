@@ -36,7 +36,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 torch.set_printoptions(sci_mode=False, precision=4)
 
-# ── maps & model ────────────────────────────────────────────────────────────
+# ── maps & model ─────────────────────────────────────────────────────────────
 from cat_maps import STAGE_MAP, CHARACTER_MAP, ACTION_MAP, PROJECTILE_TYPE_MAP
 from model     import FramePredictor, ModelConfig
 from dataset   import MeleeFrameDatasetWithDelay  # only for feature spec
@@ -191,7 +191,6 @@ def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         check_tensor_dict(state_seq, "state_seq")
     return state_seq
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # 4)  Inference wrapper
 # ════════════════════════════════════════════════════════════════════════════
@@ -251,8 +250,20 @@ def press_output(ctrl: melee.Controller,
         melee.enums.Button.BUTTON_D_UP, melee.enums.Button.BUTTON_D_DOWN,
         melee.enums.Button.BUTTON_D_LEFT, melee.enums.Button.BUTTON_D_RIGHT,
     ]
+
+    pressed = []
     for prob, btn in zip(pred["btn_probs"], idx_to_button):
-        (ctrl.press_button if prob.item() > thresh else ctrl.release_button)(btn)
+        if prob.item() > thresh:
+            ctrl.press_button(btn)
+            pressed.append(btn.name)
+        else:
+            ctrl.release_button(btn)
+
+    if DEBUG:
+        log.debug(
+            "press_output → main=(%.2f,%.2f) c=(%.2f,%.2f) L=%.2f R=%.2f buttons=%s",
+            mx, my, cx, cy, l_val, r_val, pressed
+        )
 
 # ════════════════════════════════════════════════════════════════════════════
 # 6)  Dolphin loop
@@ -283,7 +294,7 @@ if __name__ == "__main__":
     log.info("Console + controllers connected.")
 
     rows: deque[Dict[str, Any]] = deque(maxlen=ROLL_WIN)
-
+    start_wait=0
     while True:
         gs = console.step()
         if gs is None:
@@ -366,17 +377,30 @@ if __name__ == "__main__":
         # ---------- inference ----------
         rows.append(row)
         if len(rows) == ROLL_WIN:
-            pred = run_inference(list(rows))
-            ctrl = controllers[ports[0]]
-            ctrl.release_all()
-            press_output(ctrl, pred)
-            ctrl.flush()
+            start_wait+=1
+            if start_wait>90:
+                pred = run_inference(list(rows))
+                ctrl = controllers[ports[0]]
+                ctrl.release_all()
+                press_output(ctrl, pred)
+                ctrl.flush()
 
-            if gs.frame % 60 == 0:
+                # always log every frame
+                mx, my = map(float, pred["main_xy"].tolist())
+                dir_idx = int(torch.argmax(pred["c_dir_logits"]))
+                cx, cy = C_DIR_TO_FLOAT.get(dir_idx, (0.5, 0.5))
+                l_val = _safe(pred["L_val"].item(), 0.0)
+                r_val = _safe(pred["R_val"].item(), 0.0)
+                idx_to_button = [
+                    melee.enums.Button.BUTTON_A, melee.enums.Button.BUTTON_B,
+                    melee.enums.Button.BUTTON_X, melee.enums.Button.BUTTON_Y,
+                    melee.enums.Button.BUTTON_Z, melee.enums.Button.BUTTON_L,
+                    melee.enums.Button.BUTTON_R, melee.enums.Button.BUTTON_START,
+                    melee.enums.Button.BUTTON_D_UP, melee.enums.Button.BUTTON_D_DOWN,
+                    melee.enums.Button.BUTTON_D_LEFT, melee.enums.Button.BUTTON_D_RIGHT,
+                ]
+                pressed = [btn.name for prob, btn in zip(pred["btn_probs"], idx_to_button) if prob.item() > 0.5]
                 log.info(
-                    "[%d] main=%s cdir=%d btn0-3=%s",
-                    gs.frame,
-                    pred["main_xy"].tolist(),
-                    int(torch.argmax(pred["c_dir_logits"])),
-                    pred["btn_probs"][:4].tolist()
+                    "[%d] MAIN=(%.2f,%.2f) C=(%.2f,%.2f) L=%.2f R=%.2f BUTTONS=%s",
+                    gs.frame, mx, my, cx, cy, l_val, r_val, pressed
                 )

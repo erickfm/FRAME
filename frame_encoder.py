@@ -47,23 +47,23 @@ class FrameEncoder(nn.Module):
         "character":    128,
         "action":       128,
         "costume":      1,
-        "c_dir":        16,      # NEW – 5-way c-stick direction
+        "c_dir":        64,      # NEW – 5-way c-stick direction
         "proj_owner":   32,
-        "proj_type":    64,
-        "proj_subtype": 64,
+        "proj_type":    32,
+        "proj_subtype": 32,
 
         # Float / numeric groups
-        "global_numeric":   64,
+        "global_numeric":   128,
         "player_numeric":   128,
-        "nana_numeric":     96,
+        "nana_numeric":     64,
         "analog":           64,
         "proj_numeric":     64,
 
         # Boolean groups
         "buttons":      64,
         "flags":        64,
-        "nana_buttons": 64,
-        "nana_flags":   64,
+        "nana_buttons": 32,
+        "nana_flags":   32,
     }
 
     def __init__(
@@ -75,7 +75,7 @@ class FrameEncoder(nn.Module):
         num_costumes: int,
         num_proj_types: int,
         num_proj_subtypes: int,
-        d_model: int = 256,
+        d_model: int = 512,
         num_c_dirs: int = 5,   # fixed 0-4 mapping
     ):
         super().__init__()
