@@ -2,6 +2,7 @@
 # train.py  —  FRAME training with strict finiteness checks
 
 import os
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -102,17 +103,36 @@ def get_model():
     return model, cfg
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Training loop with sanity checks, anomaly detection, and checkpointing
+# CLI / logging / resume setup
+# ─────────────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="Realtime FRAME bot w/ debug")
+parser.add_argument("--debug", action="store_true", help="Verbose sanity checks")
+parser.add_argument(
+    "--resume", type=str, default=None,
+    help="Path to checkpoint (.pt) to resume from"
+)
+args = parser.parse_args()
+DEBUG = args.debug or bool(os.getenv("DEBUG", ""))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Training loop with sanity checks, anomaly detection, checkpointing, resume
 # ─────────────────────────────────────────────────────────────────────────────
 def train():
-    # will raise a stack-trace on first NaN during backward
     torch.autograd.set_detect_anomaly(True)
 
     ds = get_dataset()
     dl = get_dataloader(ds)
     model, cfg = get_model()
-
     optimiser = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # ——— optionally resume from checkpoint ———
+    start_epoch = 1
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=DEVICE)
+        model.load_state_dict(ckpt['model_state_dict'])
+        optimiser.load_state_dict(ckpt['optimizer_state_dict'])
+        start_epoch = ckpt['epoch'] + 1
+        print(f"Resumed from {args.resume}, starting at epoch {start_epoch}")
 
     wandb.init(
         project="FRAME",
@@ -129,7 +149,7 @@ def train():
     )
 
     global_step = 0
-    for epoch in range(1, NUM_EPOCHS + 1):
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
         model.train()
         epoch_loss, batch_ct = 0.0, 0
 
@@ -144,34 +164,30 @@ def train():
             # ─── sanity-check inputs ────────────────────────────────────
             for name, tensor in state.items():
                 if not torch.isfinite(tensor).all():
-                    raise RuntimeError(f"Non-finite values in state['{name}'] before forward")
+                    raise RuntimeError(f"Non-finite in state['{name}']")
             for name, tensor in target.items():
                 if not torch.isfinite(tensor).all():
-                    raise RuntimeError(f"Non-finite values in target['{name}'] before forward")
+                    raise RuntimeError(f"Non-finite in target['{name}']")
 
             # ─── forward, output-check, loss ───────────────────────────
             with torch.autograd.detect_anomaly():
                 preds = model(state)
-
-                # ─── sanity-check outputs ───────────────────────────
                 for name, tensor in preds.items():
                     if not torch.isfinite(tensor).all():
-                        raise RuntimeError(f"Non-finite values in model output '{name}' after forward")
-
+                        raise RuntimeError(f"Non-finite in output '{name}'")
                 loss, metrics = compute_loss(preds, target)
 
-                # ─── gradient stats for first batch ────────────────────
-                if i == 1 and epoch == 1:
+                # first-batch gradient stats
+                if i == 1 and epoch == start_epoch:
                     grads = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
                     print("=== GRADIENT STATS FOR FIRST BATCH ===")
                     for (pname, p), g in zip(model.named_parameters(), grads):
                         if g is None:
                             print(f"{pname:40s} | no grad")
                         else:
-                            n_nan = int(torch.isnan(g).sum().item())
-                            n_inf = int(torch.isinf(g).sum().item())
-                            norm = float(g.norm().item())
-                            print(f"{pname:40s} | norm={norm:8.3f}  nan={n_nan:4d}  inf={n_inf:4d}")
+                            print(f"{pname:40s} | norm={g.norm().item():8.3f}"
+                                  f"  nan={int(torch.isnan(g).sum())}"
+                                  f"  inf={int(torch.isinf(g).sum())}")
 
             # ─── backward & step ───────────────────────────────────────
             optimiser.zero_grad()
@@ -182,34 +198,28 @@ def train():
             # ─── logging ───────────────────────────────────────────────
             global_step += 1
             wandb.log(dict(step=global_step, loss=loss.item(), **metrics), step=global_step)
-
             epoch_loss += loss.item()
             batch_ct += 1
 
             if i % 25 == 0:
                 print(
-                    f"[{i:04d}] total={loss.item():.4f} "
-                    f"main={metrics['loss_main']:.3f} "
-                    f"l={metrics['loss_l']:.3f} "
-                    f"r={metrics['loss_r']:.3f} "
-                    f"cdir={metrics['loss_cdir']:.3f} "
-                    f"btn={metrics['loss_btn']:.3f}"
+                    f"[{i:04d}] total={loss.item():.4f} main={metrics['loss_main']:.3f}"
+                    f" l={metrics['loss_l']:.3f} r={metrics['loss_r']:.3f}"
+                    f" cdir={metrics['loss_cdir']:.3f} btn={metrics['loss_btn']:.3f}"
                 )
 
-        # ─── end epoch: checkpoint & report ───────────────────────────
+        # ─── checkpoint & report ─────────────────────────────────────
         avg_loss = epoch_loss / max(batch_ct, 1)
         print(f"Epoch {epoch} done. Avg loss={avg_loss:.4f}")
-
         os.makedirs("checkpoints", exist_ok=True)
-        path = f"checkpoints/epoch_{epoch:02d}.pt"
+        ckpt_path = f"checkpoints/epoch_{epoch:02d}.pt"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimiser.state_dict(),
             'config': cfg.__dict__,
-        }, path)
-        print("Saved checkpoint →", path)
-
+        }, ckpt_path)
+        print("Saved checkpoint →", ckpt_path)
         wandb.log(dict(epoch=epoch, avg_loss=avg_loss), step=global_step)
 
     wandb.finish()
