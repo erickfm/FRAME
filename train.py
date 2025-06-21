@@ -18,7 +18,7 @@ from model import FramePredictor, ModelConfig
 # ─────────────────────────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BATCH_SIZE      = 1
+BATCH_SIZE      = 256
 NUM_EPOCHS      = 50
 LEARNING_RATE   = 3e-4
 NUM_WORKERS     = 16
