@@ -67,12 +67,12 @@ def compute_loss(preds, targets):
     loss_cdir = safe_loss(bce,  cdir_pred, cdir_tgt, "c_dir")
     loss_btn  = safe_loss(bce,  btn_pred,  btn_tgt,  "btns")
 
-    total = loss_main + loss_l + loss_r + loss_cdir + loss_btn
+    total = loss_main + loss_l + loss_r + (10*loss_cdir) + loss_btn
     return total, dict(
         loss_main=loss_main.item(),
         loss_l=loss_l.item(),
         loss_r=loss_r.item(),
-        loss_cdir=loss_cdir.item(),
+        loss_cdir=loss_cdir.item()*10,
         loss_btn=loss_btn.item(),
     )
 
