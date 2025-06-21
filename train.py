@@ -47,44 +47,40 @@ def safe_loss(fn, pred, tgt, name):
     return out
 
 def compute_loss(preds, targets):
-    # Loss functions
+    # ── Loss fns ─────────────────────────────────────────────────────────────
     mse_loss = nn.MSELoss()
     ce_loss  = nn.CrossEntropyLoss(reduction='mean')
     bce_loss = nn.BCEWithLogitsLoss()
 
     # ── Predictions ─────────────────────────────────────────────────────────
-    main_pred = preds["main_xy"]            # [B, T, 2]
-    l_pred    = preds["L_val"].squeeze(-1)  # [B, T]
-    r_pred    = preds["R_val"].squeeze(-1)  # [B, T]
-    c_logits  = preds["c_dir_logits"]       # [B, T, 5]
-    btn_pred  = preds["btn_logits"]         # [B, T, 12]
+    main_pred = preds["main_xy"]           # [B, 2]
+    l_pred    = preds["L_val"].squeeze(-1) # [B]
+    r_pred    = preds["R_val"].squeeze(-1) # [B]
+    c_logits  = preds["c_dir_logits"]      # [B, 5]
+    btn_pred  = preds["btn_logits"]        # [B, 12]
 
     # ── Targets ─────────────────────────────────────────────────────────────
     main_tgt = torch.stack(
         [targets["main_x"], targets["main_y"]], dim=-1
-    )                                        # [B, T, 2]
-    l_tgt    = targets["l_shldr"]            # [B, T]
-    r_tgt    = targets["r_shldr"]            # [B, T]
-    cdir_tgt = targets["c_dir"].long()       # one-hot [B, T, 5]
-    btn_tgt  = targets.get("btns", targets.get("btns_float")).float()  # [B, T, 12]
+    )                                       # [B, 2]
+    l_tgt    = targets["l_shldr"]           # [B]
+    r_tgt    = targets["r_shldr"]           # [B]
+    cdir_tgt = targets["c_dir"].long()      # [B, 5] one-hot
+    btn_tgt  = targets.get("btns", targets.get("btns_float")).float()  # [B, 12]
 
     # ── Compute each head’s loss ────────────────────────────────────────────
     loss_main = safe_loss(mse_loss, main_pred, main_tgt, "main_xy")
     loss_l    = safe_loss(mse_loss, l_pred,    l_tgt,    "L_val")
     loss_r    = safe_loss(mse_loss, r_pred,    r_tgt,    "R_val")
 
-    # flatten for CrossEntropyLoss: [(B*T), 5] logits & [(B*T)] targets
-    B, T, C = c_logits.shape
-    logits = c_logits.view(B * T, C)
-    tgt_idx = cdir_tgt.argmax(dim=-1).view(-1)
-    loss_cdir = safe_loss(ce_loss, logits, tgt_idx, "c_dir")
+    # for CrossEntropy we need class‐indices: [B]
+    tgt_idx   = cdir_tgt.argmax(dim=-1)
+    loss_cdir = safe_loss(ce_loss, c_logits, tgt_idx, "c_dir")
 
     loss_btn  = safe_loss(bce_loss, btn_pred, btn_tgt, "btns")
 
-    # ── Total & metrics ────────────────────────────────────────────────────
-    # start with equal weighting; you can scale loss_cdir if needed
+    # ── Total & reporting ───────────────────────────────────────────────────
     total = loss_main + loss_l + loss_r + loss_cdir + loss_btn
-
     metrics = {
         "loss_main": loss_main.item(),
         "loss_l":    loss_l.item(),
