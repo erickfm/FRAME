@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # train.py — FRAME training with strict finiteness checks
-#            + AdamW, GradNorm, and fp16 AMP (PyTorch ≥ 2.3)
+#            + AdamW, GradNorm, and fp16 AMP (PyTorch ≥2.3, compatible)
 
 import os
 import argparse
@@ -10,7 +10,7 @@ import torch.optim as optim
 import torch.nn.utils as nn_utils
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast          # autocast still lives here
-from torch.amp      import GradScaler        # moved to torch.amp in 2.3+
+from torch.amp      import GradScaler        # new namespace (≥2.3)
 import wandb
 
 from dataset import MeleeFrameDatasetWithDelay
@@ -136,12 +136,12 @@ def train():
     ds          = get_dataset()
     dl          = get_dataloader(ds)
     model, cfg  = get_model()
-    scaler      = GradScaler(enabled=USE_AMP, device_type="cuda")
+    scaler      = GradScaler(enabled=USE_AMP)      # ← fixed line
 
-    # ── GradNorm weights (learnable) ───────────────────────────────────────
+    # GradNorm weights
     loss_weights = torch.nn.Parameter(torch.ones(len(TASK_NAMES), device=DEVICE))
 
-    # ── AdamW param-groups ─────────────────────────────────────────────────
+    # AdamW param groups
     decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -156,7 +156,7 @@ def train():
         betas=(0.9, 0.999),
     )
 
-    # ── Optional resume ────────────────────────────────────────────────────
+    # resume checkpoint (unchanged) -----------------------------------------
     start_epoch    = 1
     init_task_loss = None
     if args.resume:
@@ -194,7 +194,7 @@ def train():
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
 
         for i, (state, target) in enumerate(dl, 1):
-            # ── move to GPU & sanity-check inputs ─────────────────────────
+            # ── move & sanity-check inputs
             for k, v in state.items():
                 state[k] = v.to(DEVICE, non_blocking=True)
                 if not torch.isfinite(state[k]).all():
@@ -204,24 +204,21 @@ def train():
                 if not torch.isfinite(target[k]).all():
                     raise RuntimeError(f"Non-finite in target['{k}']")
 
-            # ── forward (fp16 autocast) ──────────────────────────────────
+            # forward (fp16 autocast)
             with autocast(enabled=USE_AMP):
                 preds = model(state)
 
-            # sanity-check model outputs
+            # sanity-check outputs
             for name, t in preds.items():
                 if not torch.isfinite(t).all():
                     raise RuntimeError(f"Non-finite in output '{name}'")
 
-            # ── compute task losses (fp32) ───────────────────────────────
             metrics, task_losses = compute_loss(preds, target)
             loss_vec = torch.stack(task_losses)
 
-            # capture baseline losses for GradNorm
             if init_task_loss is None:
                 init_task_loss = loss_vec.detach()
 
-            # GradNorm weighting
             weighted   = loss_weights * loss_vec
             task_loss  = weighted.sum()
 
@@ -232,7 +229,6 @@ def train():
 
             total_loss = task_loss + gradnorm
 
-            # first-batch gradient stats (unchanged from your original)
             if i == 1 and epoch == start_epoch:
                 grads = torch.autograd.grad(total_loss,
                                             model.parameters(),
@@ -246,17 +242,15 @@ def train():
                               f"  nan={int(torch.isnan(g).sum())}"
                               f"  inf={int(torch.isinf(g).sum())}")
 
-            # ── backward / step (fp16 scaler) ────────────────────────────
             optimiser.zero_grad(set_to_none=True)
             scaler.scale(total_loss).backward()
-            scaler.unscale_(optimiser)                   # real grads for clipping
+            scaler.unscale_(optimiser)
             nn_utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             scaler.step(optimiser)
             scaler.update()
 
             loss_weights.data.clamp_(min=0.0)
 
-            # ── logging ─────────────────────────────────────────────────
             global_step += 1
             wandb.log(
                 dict(step=global_step,
@@ -281,7 +275,6 @@ def train():
         avg = epoch_loss / max(batch_ct, 1)
         print(f"Epoch {epoch} done. Avg loss={avg:.4f}")
 
-        # ── checkpoint ──────────────────────────────────────────────────
         os.makedirs("checkpoints", exist_ok=True)
         ckpt_path = f"checkpoints/epoch_{epoch:02d}.pt"
         torch.save({
