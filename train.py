@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# train.py — FRAME training with strict finiteness checks,
-#            AdamW + GradNorm + optional AMP (mixed-precision, PyTorch ≥2.3)
+# train.py — FRAME training with strict finiteness checks
+#            + AdamW, GradNorm, and fp16 AMP (PyTorch ≥ 2.3)
 
 import os
 import argparse
@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.utils as nn_utils
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast                 # still lives here
-from torch.amp      import GradScaler               # new namespace (≥2.3)
+from torch.cuda.amp import autocast          # autocast still lives here
+from torch.amp      import GradScaler        # moved to torch.amp in 2.3+
 import wandb
 
 from dataset import MeleeFrameDatasetWithDelay
@@ -24,7 +24,7 @@ DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE       = 256
 NUM_EPOCHS       = 50
 LEARNING_RATE    = 3e-4
-WEIGHT_DECAY     = 1e-2              # for AdamW, weights only
+WEIGHT_DECAY     = 1e-2              # AdamW true weight-decay (weights only)
 NUM_WORKERS      = 16
 SEQUENCE_LENGTH  = 60
 REACTION_DELAY   = 1
@@ -34,7 +34,7 @@ GRAD_CLIP_NORM   = 1.0
 GRADNORM_ALPHA   = 1.0
 TASK_NAMES       = ["main", "l", "r", "cdir", "btn"]
 
-USE_AMP          = torch.cuda.is_available()  # disable automatically on CPU
+USE_AMP          = torch.cuda.is_available()   # fp16 autocast only if CUDA
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Collate
@@ -48,7 +48,7 @@ def collate_fn(batch):
     return batch_state, batch_target
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Per-task loss helpers
+# 3. Loss helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def safe_loss(fn, pred, tgt, name):
     out = fn(pred, tgt)
@@ -120,7 +120,7 @@ def get_model():
 # CLI / logging / resume
 # ─────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(
-    description="FRAME trainer w/ GradNorm + AdamW + AMP (≥2.3)")
+    description="FRAME trainer w/ GradNorm, AdamW, fp16 AMP")
 parser.add_argument("--debug",  action="store_true")
 parser.add_argument("--resume", type=str, default=None,
                     help="Path to checkpoint (.pt) to resume from")
@@ -138,10 +138,10 @@ def train():
     model, cfg  = get_model()
     scaler      = GradScaler(enabled=USE_AMP, device_type="cuda")
 
-    # learnable GradNorm weights
+    # ── GradNorm weights (learnable) ───────────────────────────────────────
     loss_weights = torch.nn.Parameter(torch.ones(len(TASK_NAMES), device=DEVICE))
 
-    # AdamW param groups
+    # ── AdamW param-groups ─────────────────────────────────────────────────
     decay, no_decay = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -156,7 +156,7 @@ def train():
         betas=(0.9, 0.999),
     )
 
-    # resume if provided
+    # ── Optional resume ────────────────────────────────────────────────────
     start_epoch    = 1
     init_task_loss = None
     if args.resume:
@@ -194,19 +194,30 @@ def train():
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
 
         for i, (state, target) in enumerate(dl, 1):
+            # ── move to GPU & sanity-check inputs ─────────────────────────
             for k, v in state.items():
-                state[k]  = v.to(DEVICE, non_blocking=True)
+                state[k] = v.to(DEVICE, non_blocking=True)
+                if not torch.isfinite(state[k]).all():
+                    raise RuntimeError(f"Non-finite in state['{k}']")
             for k, v in target.items():
                 target[k] = v.to(DEVICE, non_blocking=True)
+                if not torch.isfinite(target[k]).all():
+                    raise RuntimeError(f"Non-finite in target['{k}']")
 
-            # mixed-precision forward
+            # ── forward (fp16 autocast) ──────────────────────────────────
             with autocast(enabled=USE_AMP):
                 preds = model(state)
 
-            # task losses (fp32 outside autocast)
+            # sanity-check model outputs
+            for name, t in preds.items():
+                if not torch.isfinite(t).all():
+                    raise RuntimeError(f"Non-finite in output '{name}'")
+
+            # ── compute task losses (fp32) ───────────────────────────────
             metrics, task_losses = compute_loss(preds, target)
             loss_vec = torch.stack(task_losses)
 
+            # capture baseline losses for GradNorm
             if init_task_loss is None:
                 init_task_loss = loss_vec.detach()
 
@@ -221,22 +232,31 @@ def train():
 
             total_loss = task_loss + gradnorm
 
-            optimiser.zero_grad()
+            # first-batch gradient stats (unchanged from your original)
+            if i == 1 and epoch == start_epoch:
+                grads = torch.autograd.grad(total_loss,
+                                            model.parameters(),
+                                            retain_graph=True)
+                print("=== GRADIENT STATS FOR FIRST BATCH ===")
+                for (pname, p), g in zip(model.named_parameters(), grads):
+                    if g is None:
+                        print(f"{pname:40s} | no grad")
+                    else:
+                        print(f"{pname:40s} | norm={g.norm().item():8.3f}"
+                              f"  nan={int(torch.isnan(g).sum())}"
+                              f"  inf={int(torch.isinf(g).sum())}")
 
-            # AMP backward / step
+            # ── backward / step (fp16 scaler) ────────────────────────────
+            optimiser.zero_grad(set_to_none=True)
             scaler.scale(total_loss).backward()
-            if USE_AMP:
-                scaler.unscale_(optimiser)
+            scaler.unscale_(optimiser)                   # real grads for clipping
             nn_utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-            if USE_AMP:
-                scaler.step(optimiser)
-                scaler.update()
-            else:
-                optimiser.step()
+            scaler.step(optimiser)
+            scaler.update()
 
             loss_weights.data.clamp_(min=0.0)
 
-            # logging
+            # ── logging ─────────────────────────────────────────────────
             global_step += 1
             wandb.log(
                 dict(step=global_step,
@@ -261,6 +281,7 @@ def train():
         avg = epoch_loss / max(batch_ct, 1)
         print(f"Epoch {epoch} done. Avg loss={avg:.4f}")
 
+        # ── checkpoint ──────────────────────────────────────────────────
         os.makedirs("checkpoints", exist_ok=True)
         ckpt_path = f"checkpoints/epoch_{epoch:02d}.pt"
         torch.save({
@@ -269,7 +290,7 @@ def train():
             "optimizer_state_dict": optimiser.state_dict(),
             "loss_weights":         loss_weights.data.cpu(),
             "init_task_loss":       init_task_loss.cpu(),
-            "scaler_state_dict":    scaler.state_dict() if USE_AMP else None,
+            "scaler_state_dict":    scaler.state_dict(),
             "config":               cfg.__dict__,
         }, ckpt_path)
         print("Saved →", ckpt_path)
