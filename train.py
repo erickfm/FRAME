@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # train.py — FRAME training with strict finiteness checks,
-#            AdamW + GradNorm + optional AMP (mixed-precision)
+#            AdamW + GradNorm + optional AMP (mixed-precision, PyTorch ≥2.3)
 
 import os
 import argparse
@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.utils as nn_utils
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast                 # still lives here
+from torch.amp      import GradScaler               # new namespace (≥2.3)
 import wandb
 
 from dataset import MeleeFrameDatasetWithDelay
@@ -33,7 +34,7 @@ GRAD_CLIP_NORM   = 1.0
 GRADNORM_ALPHA   = 1.0
 TASK_NAMES       = ["main", "l", "r", "cdir", "btn"]
 
-USE_AMP          = torch.cuda.is_available()  # toggle if you need fp32 only
+USE_AMP          = torch.cuda.is_available()  # disable automatically on CPU
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Collate
@@ -118,9 +119,10 @@ def get_model():
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI / logging / resume
 # ─────────────────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="FRAME trainer w/ GradNorm + AdamW + AMP")
-parser.add_argument("--debug",   action="store_true")
-parser.add_argument("--resume",  type=str, default=None,
+parser = argparse.ArgumentParser(
+    description="FRAME trainer w/ GradNorm + AdamW + AMP (≥2.3)")
+parser.add_argument("--debug",  action="store_true")
+parser.add_argument("--resume", type=str, default=None,
                     help="Path to checkpoint (.pt) to resume from")
 args  = parser.parse_args()
 DEBUG = args.debug or bool(os.getenv("DEBUG", ""))
@@ -134,7 +136,7 @@ def train():
     ds          = get_dataset()
     dl          = get_dataloader(ds)
     model, cfg  = get_model()
-    scaler      = GradScaler(enabled=USE_AMP)
+    scaler      = GradScaler(enabled=USE_AMP, device_type="cuda")
 
     # learnable GradNorm weights
     loss_weights = torch.nn.Parameter(torch.ones(len(TASK_NAMES), device=DEVICE))
@@ -147,8 +149,8 @@ def train():
         (no_decay if n.endswith("bias") or "norm" in n.lower() else decay).append(p)
 
     optimiser = optim.AdamW(
-        [{"params": decay,        "weight_decay": WEIGHT_DECAY},
-         {"params": no_decay,     "weight_decay": 0.0},
+        [{"params": decay,          "weight_decay": WEIGHT_DECAY},
+         {"params": no_decay,       "weight_decay": 0.0},
          {"params": [loss_weights], "weight_decay": 0.0}],
         lr=LEARNING_RATE,
         betas=(0.9, 0.999),
@@ -201,7 +203,7 @@ def train():
             with autocast(enabled=USE_AMP):
                 preds = model(state)
 
-            # compute task losses (fp32 outside autocast)
+            # task losses (fp32 outside autocast)
             metrics, task_losses = compute_loss(preds, target)
             loss_vec = torch.stack(task_losses)
 
@@ -268,7 +270,7 @@ def train():
             "loss_weights":         loss_weights.data.cpu(),
             "init_task_loss":       init_task_loss.cpu(),
             "scaler_state_dict":    scaler.state_dict() if USE_AMP else None,
-            "config": cfg.__dict__,
+            "config":               cfg.__dict__,
         }, ckpt_path)
         print("Saved →", ckpt_path)
         wandb.log(dict(epoch=epoch, avg_loss=avg), step=global_step)
