@@ -28,11 +28,11 @@ from cat_maps import (
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ModelConfig:
-    # model size (tiny “overfit” test)
-    d_model: int         = 512      # was 512
+    # model size
+    d_model: int         = 1024      # was 512
     nhead: int           = 8       # d_model must be divisible by nhead
     num_layers: int      = 4       # was 4
-    dim_feedforward: int = 1024     # was 1024
+    dim_feedforward: int = 2048     # was 1024
     dropout: float       = 0.0     # turn off dropout to help overfit
 
     # sequence length
