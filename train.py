@@ -25,7 +25,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE      = 256
 NUM_EPOCHS      = 200
-LEARNING_RATE   = 3e-4
+LEARNING_RATE   = 2e-4
 WEIGHT_DECAY    = 1e-2            # AdamW (weights only)
 NUM_WORKERS     = 16
 SEQUENCE_LENGTH = 60
