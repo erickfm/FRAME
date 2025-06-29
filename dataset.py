@@ -167,6 +167,7 @@ class MeleeFrameDataset(Dataset):
             "_c_dir":{i:i for i in range(5)},
             "_port": {i: i for i in range(4)},  # 0-3 GameCube ports
             "_owner": {i: i for i in range(4)},  # projectile owner port id
+            "_costume": {i: i for i in range(8)},  # vanilla Melee has ≤8 per char
         }
 
     def __len__(self): return len(self.index)
@@ -210,7 +211,10 @@ class MeleeFrameDataset(Dataset):
         df["self_nana_facing"] =(df["self_nana_facing"] >0).astype("float32")
         df["opp_nana_facing"]  =(df["opp_nana_facing"]  >0).astype("float32")
 
-        df=df.fillna(0.0).infer_objects(copy=False)
+        # fill numeric + bool columns with 0.0, leave any object columns untouched
+        num_bool_cols = df.select_dtypes(["number", "bool"]).columns
+        if len(num_bool_cols):
+            df[num_bool_cols] = df[num_bool_cols].fillna(0.0)
 
         # enum mapping
         for name,spec in TOKEN_SPEC.items():
