@@ -164,6 +164,7 @@ class MeleeFrameDataset(Dataset):
             "_character":CHARACTER_MAP,
             "_action":ACTION_MAP,
             "_type":PROJECTILE_TYPE_MAP,
+            "_subtype": {i: i for i in range(42)},  # arbitrary cause idk how many subtypes for projectiles
             "_c_dir":{i:i for i in range(5)},
             "_port": {i: i for i in range(4)},  # 0-3 GameCube ports
             "_owner": {i: i for i in range(4)},  # projectile owner port id
