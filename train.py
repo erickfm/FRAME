@@ -15,7 +15,7 @@ from torch.amp import autocast, GradScaler
 
 import wandb
 
-from dataset import MeleeFrameDatasetWithDelay
+from dataset import MeleeFrameDataset
 from model   import FramePredictor, ModelConfig
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ def compute_loss(preds, targets):
 # 4. Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def get_dataset():
-    return MeleeFrameDatasetWithDelay(
+    return MeleeFrameDataset(
         parquet_dir=DATA_DIR,
         sequence_length=SEQUENCE_LENGTH,
         reaction_delay=REACTION_DELAY,
