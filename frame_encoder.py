@@ -187,11 +187,7 @@ class FrameEncoder(nn.Module):
         #── GAME_STATE ──────────────────────────────────────────────────
         geom = seq["stage_geom"]                        # (B,T,15)
 
-        extras = torch.stack([
-            seq["randall_height"],
-            seq["randall_left"],
-            seq["randall_right"],
-        ], dim=-1)                                     # (B,T,3)
+        extras = seq["randall"]                         # (B,T,3)                                   # (B,T,3)
 
         floats_gs = torch.cat(
             [geom, extras, seq["distance"].unsqueeze(-1), seq["frame"].unsqueeze(-1)], dim=-1
