@@ -165,6 +165,8 @@ class MeleeFrameDataset(Dataset):
             "_action":ACTION_MAP,
             "_type":PROJECTILE_TYPE_MAP,
             "_c_dir":{i:i for i in range(5)},
+            "_port": {i: i for i in range(4)},  # 0-3 GameCube ports
+            "_owner": {i: i for i in range(4)},  # projectile owner port id
         }
 
     def __len__(self): return len(self.index)
