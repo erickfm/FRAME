@@ -101,8 +101,8 @@ def compute_loss(preds, targets):
 def get_dataset():
     return MeleeFrameDataset(
         parquet_dir=DATA_DIR,
-        sequence_length=SEQUENCE_LENGTH,
-        reaction_delay=REACTION_DELAY,
+        seq_len=SEQUENCE_LENGTH,
+        delay=REACTION_DELAY,
     )
 
 def get_dataloader(ds):
