@@ -129,7 +129,7 @@ class FrameEncoder(nn.Module):
         self.tokens = nn.ModuleDict({
             "GAME_STATE": CompositeToken(
                 cat_specs=[num_stages],        # stage only
-                n_float=18, n_bool=0
+                n_float=20, n_bool=0
             ),
             "SELF_INPUT": CompositeToken(
                 cat_specs=[num_c_dirs],
@@ -203,8 +203,8 @@ class FrameEncoder(nn.Module):
         ], dim=-1)                                     # (B,T,3)
 
         floats_gs = torch.cat(
-            [geom, extras, seq["distance"].unsqueeze(-1)], dim=-1
-        )                                               # (B,T,18)
+            [geom, extras, seq["distance"].unsqueeze(-1), seq["frame"].unsqueeze(-1)], dim=-1
+        )                                               # (B,T,20)
 
         a(self.tokens["GAME_STATE"](
             cats=[seq["stage"]],

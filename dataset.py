@@ -84,6 +84,7 @@ TOKEN_SPEC: Dict[str, TensorSpec] = {
     "randall":       TensorSpec(["randall_height","randall_left","randall_right"],
                                 "float32",(3,),     "GAME_STATE"),
     "distance":      TensorSpec(["distance"],        "float32",(),     "GAME_STATE"),
+    "frame":         TensorSpec(["frame"],           "float32",(),     "GAME_STATE"),
 
     # SELF / OPP INPUT
     "self_c_dir":    TensorSpec(["self_c_dir"],      "int64",  (),     "SELF_INPUT"),
