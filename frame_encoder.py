@@ -1,16 +1,26 @@
-# frame_encoder.py – intra‑frame cross‑attention version
+# frame_encoder.py – intra‑frame cross‑attention (Composite‑Token v2, verbose comments)
 # -----------------------------------------------------------------------------
-# Converts structured Melee frame dictionaries -> (B, T, d_model) tensor.
-# Compared to the old "flat‑concat" encoder, this version:
-#   1. Builds **one token per feature‑group** (stage, sticks, buttons …)
-#   2. Runs 1–2 layers of **self‑attention across those tokens** *inside the frame*
-#   3. Pools via a learned `[CLS]` token → single 256‑d summary vector
-#   4. Projects up to `d_model` (1024) so it plugs into the temporal Transformer
+# Converts one structured Melee frame (already batched as tensors) → (B, T, d_model)
+# tensor that a *temporal* Transformer can ingest.  Design philosophy mirrors the
+# original “v1” version you liked, but we adopt the leaner parameterisation from
+# your preferred v2 (smaller cat‑emb floors, scaled numeric mixers, bias terms).
+#
+#   1.  **Exactly one 256‑d token per high‑level gameplay concept**
+#         (GAME_STATE, SELF_INPUT, SELF_STATE, OPP_INPUT, OPP_STATE,
+#          NANA_SELF, NANA_OPP, PROJECTILES)
+#   2.  Each token is produced by a *CompositeToken* mini‑encoder that fuses
+#       categorical IDs, floats and bools into a fixed‑width vector.
+#       – Category fields → tiny learned embeddings (4 ≤ d ≤ 16)
+#       – Float / Bool groups → skinny Linear → GELU (bias=True for flexibility)
+#   3.  Two layers of self‑attention across the 8 tokens *within a frame* let
+#       concepts exchange information.  A learnable [CLS] query pools them.
+#   4.  The pooled 256‑d summary vector is LayerNorm + Linear‑projected up to
+#       `d_model` (default 1024) so the *temporal* Transformer that follows sees
+#       a familiar model width.
 # -----------------------------------------------------------------------------
-
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import List, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -18,218 +28,275 @@ import torch.nn as nn
 # -----------------------------------------------------------------------------
 # Hyper‑params / helpers
 # -----------------------------------------------------------------------------
-DROPOUT_P = 0.10          # global dropout applied everywhere
-D_INTRA   = 256           # width for intra‑frame tokens
+DROPOUT_P: float = 0.10          # global dropout applied everywhere
+D_INTRA:   int   = 256           # width of every concept token (post‑projection)
 
 
-def _mlp(in_dim: int, out_dim: int) -> nn.Sequential:
-    """LayerNorm → Linear → GELU → Dropout."""
-    return nn.Sequential(
-        nn.LayerNorm(in_dim),
-        nn.Linear(in_dim, out_dim),
-        nn.GELU(),
-        nn.Dropout(DROPOUT_P),
-    )
+def _embed_dim(cardinality: int) -> int:
+    """Heuristic: embed dims grow gently with |vocab|^0.25 (min 4).
+
+    ‑ Very small enums (≤ 4 distinct values) get a 4‑d embedding.
+    ‑ Mid‑sized enums (e.g. 90 characters) land around 12‑16 dims.
+    """
+    return max(4, int(cardinality ** 0.25 * 4))
 
 
 # -----------------------------------------------------------------------------
-# Intra‑frame pooling via a mini Transformer (a.k.a Set Attention / PMA)
+#  CompositeToken – glue cats / floats / bools for *one* concept
 # -----------------------------------------------------------------------------
-class _GroupAttention(nn.Module):
-    """Self‑attention across the G feature‑group tokens inside **one** frame."""
+class CompositeToken(nn.Module):
+    """Fuses heterogeneous feature groups into a fixed‑width concept vector.
 
-    def __init__(self, d_intra: int = D_INTRA, nhead: int = 4, nlayers: int = 2, k_query: int = 1):
+    Parameters
+    ----------
+    cat_specs : list[int]
+        Cardinalities for *each* categorical field in the concept.
+    n_float   : int
+        Count of raw float features (already z‑scored by the Dataset collate).
+    n_bool    : int
+        Count of boolean indicator features (0/1, will be cast to float).
+    d_out     : int
+        Token width after projection (defaults to **D_INTRA = 256**).
+    """
+
+    def __init__(self, *, cat_specs: Sequence[int], n_float: int,
+                 n_bool: int, d_out: int = D_INTRA) -> None:
         super().__init__()
 
+        # ––– tiny embeddings per categorical field –––
+        self.cat_embs = nn.ModuleList(
+            nn.Embedding(card, _embed_dim(card)) for card in cat_specs)
+
+        # ––– lightweight linears for numeric groups –––
+        # Dim scales with feature count to avoid the fixed 64/32‑d cost in v1.
+        float_dim = max(16, n_float * 4) if n_float else 0
+        bool_dim  = max( 8, n_bool  * 4) if n_bool  else 0
+
+        self.float_lin: nn.Module | None = (
+            nn.Linear(n_float, float_dim, bias=True) if n_float else None)
+        self.bool_lin:  nn.Module | None = (
+            nn.Linear(n_bool,  bool_dim,  bias=True) if n_bool  else None)
+
+        concat_dim = sum(e.embedding_dim for e in self.cat_embs) + float_dim + bool_dim
+
+        # ––– final projection to token width –––
+        self.mix = nn.Sequential(
+            nn.LayerNorm(concat_dim),
+            nn.Linear(concat_dim, d_out, bias=True),
+            nn.GELU(),
+            nn.Dropout(DROPOUT_P),
+        )
+
+    # ---------------------------------------------------------------------
+    def forward(self, *, cats: List[torch.Tensor],
+                floats: torch.Tensor | None,
+                bools: torch.Tensor | None) -> torch.Tensor:
+        """All inputs arrive batched as (B, T, …) from the Dataset."""
+        parts: List[torch.Tensor] = [emb(c) for emb, c in zip(self.cat_embs, cats)]
+        if floats is not None:
+            parts.append(self.float_lin(floats))       # type: ignore[arg-type]
+        if bools is not None:
+            parts.append(self.bool_lin(bools.float()))  # type: ignore[arg-type]
+        return self.mix(torch.cat(parts, dim=-1))      # (B,T,256)
+
+
+# -----------------------------------------------------------------------------
+# Intra‑frame pooling via a *mini* Transformer (a.k.a. PMA / Set‑Attention)
+# -----------------------------------------------------------------------------
+class _GroupAttention(nn.Module):
+    """Two‑layer self‑attention across the N concept tokens inside **one** frame."""
+
+    def __init__(self, d_intra: int = D_INTRA, nhead: int = 4,
+                 nlayers: int = 2, k_query: int = 1):
+        super().__init__()
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_intra,
             nhead=nhead,
             dim_feedforward=4 * d_intra,
             dropout=DROPOUT_P,
-            batch_first=True,  # (B, N, C)
+            batch_first=True,   # expect (B, N, C)
         )
         self.encoder = nn.TransformerEncoder(enc_layer, nlayers)
 
-        # k learnable query tokens (k=1 → classic [CLS])
+        # Learnable [CLS] (or k>1) query tokens -----------------
         self.k_query = k_query
         self.queries = nn.Parameter(torch.randn(k_query, d_intra) * 0.02)
 
-    def forward(self, group_tokens: torch.Tensor) -> torch.Tensor:
-        """Parameters
-        ----------
-        group_tokens : Tensor
-            (B*T, G, d_intra) stacked tokens for one frame per batch‑time example.
-
-        Returns
-        -------
-        Tensor
-            (B*T, d_intra) pooled representation.
-        """
-        BxT = group_tokens.size(0)
-        k = self.k_query
-        # Insert learned queries at the front: shape (B*T, k+G, d_intra)
-        q = self.queries.unsqueeze(0).expand(BxT, -1, -1)
-        x = torch.cat([q, group_tokens], dim=1)
-        h = self.encoder(x)        # full self‑attention, no mask
-
-        if k == 1:
-            pooled = h[:, 0]       # (B*T, d_intra)
-        else:
-            # mean the k query outputs (≈ PMA pooling)
-            pooled = h[:, :k].mean(dim=1)
-        return pooled
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """tokens: (B*T, N, d_intra) → pooled (B*T, d_intra)."""
+        bt = tokens.size(0)
+        q = self.queries.unsqueeze(0).expand(bt, -1, -1)   # (B*T,k,d)
+        h = self.encoder(torch.cat([q, tokens], dim=1))    # (B*T,k+N,d)
+        return h[:, :self.k_query].mean(dim=1)             # average if k>1
 
 
 # -----------------------------------------------------------------------------
-# FrameEncoder – cross‑attention version
+# FrameEncoder – orchestrates token build ➜ intra‑frame attention ➜ projection
 # -----------------------------------------------------------------------------
 class FrameEncoder(nn.Module):
-    """Encode per‑frame structured dict → (B, T, d_model) using intra‑frame attention."""
+    """Encode a time‑sequence of structured frame dicts → (B, T, d_model)."""
 
-    # ------- Constants describing raw numeric dims from the dataset ---------
-    GLOBAL_NUM   = 20
-    PLAYER_NUM   = 22
-    NANA_NUM     = 27
-    ANALOG_DIM   = 4      # main_x, main_y, l, r
-    BTN_DIM      = 12
-    FLAGS_DIM    = 5
-    NANA_FLAGS   = 6
-    PROJ_NUM_PER = 5
-    PROJ_SLOTS   = 8
+    # ––– constants for Dataset numeric buckets –––
+    STICK_FLOATS   = 8     # main_x, main_y, l, r ×2 (self / opp)
+    BUTTON_BOOLS   = 12    # per player
 
-    def __init__(
-        self,
-        *,
-        num_stages: int,
-        num_ports: int,
-        num_characters: int,
-        num_actions: int,
-        num_costumes: int,
-        num_proj_types: int,
-        num_proj_subtypes: int,
-        d_model: int = 1024,
-        num_c_dirs: int = 5,
-    ) -> None:
+    def __init__(self,
+                 *,
+                 num_stages: int,
+                 num_characters: int,
+                 num_actions: int,
+                 num_costumes: int,
+                 num_proj_types: int,
+                 num_proj_subtypes: int,
+                 d_model: int = 1024,
+                 num_ports: int = 4,
+                 proj_slots: int = 8) -> None:
         super().__init__()
+        self.proj_slots = proj_slots
 
-        # -------------- Embeddings / per‑group encoders ----------------------
-        # Categorical → Emb + Linear → d_intra
-        def cat_block(n_vocab: int) -> nn.Module:
-            return nn.Sequential(
-                nn.Embedding(n_vocab, D_INTRA),
-                nn.Dropout(DROPOUT_P),
-            )
+        # -----------------------------------------------------------------
+        # 1.  Build one CompositeToken *module* per gameplay concept
+        # -----------------------------------------------------------------
+        self.tokens = nn.ModuleDict({
+            # GAME_STATE  (stage, randall) + 14 blast‑zone/platform edges + distance
+            "GAME_STATE": CompositeToken(cat_specs=[num_stages, 4],
+                                         n_float=15, n_bool=0),
+            # SELF / OPP inputs (analog + buttons)
+            "SELF_INPUT": CompositeToken(cat_specs=[], n_float=8, n_bool=12),
+            "OPP_INPUT" : CompositeToken(cat_specs=[], n_float=8, n_bool=12),
+            # SELF / OPP state
+            "SELF_STATE": CompositeToken(cat_specs=[num_ports, num_characters,
+                                                     num_actions, num_costumes, 2],
+                                         n_float=23, n_bool=9),
+            "OPP_STATE" : CompositeToken(cat_specs=[num_ports, num_characters,
+                                                     num_actions, num_costumes, 2],
+                                         n_float=23, n_bool=9),
+            # Nana tokens
+            "NANA_SELF" : CompositeToken(cat_specs=[num_characters, num_actions],
+                                         n_float=24, n_bool=17),
+            "NANA_OPP"  : CompositeToken(cat_specs=[num_characters, num_actions],
+                                         n_float=24, n_bool=17),
+            # PROJECTILES – flatten *proj_slots* heterogeneous slots into one bundle
+            "PROJECTILES": CompositeToken(cat_specs=[num_proj_types, num_proj_subtypes, 3]
+                                               * proj_slots,
+                                            n_float=5 * proj_slots,
+                                            n_bool=0),
+        })
 
-        self.stage_emb      = cat_block(num_stages)
-        self.port_emb       = cat_block(num_ports)
-        self.char_emb       = cat_block(num_characters)
-        self.act_emb        = cat_block(num_actions)
-        self.cost_emb       = cat_block(num_costumes)
-        self.cdir_emb       = cat_block(num_c_dirs)
-        self.ptype_emb      = cat_block(num_proj_types)
-        self.psub_emb       = cat_block(num_proj_subtypes)
+        # -----------------------------------------------------------------
+        # 2.  Intra‑frame cross‑attention & pooling
+        # -----------------------------------------------------------------
+        self.set_attn = _GroupAttention(d_intra=D_INTRA, nhead=4, nlayers=2)
 
-        # Numeric / boolean groups → small MLP → d_intra
-        self.glob_enc       = _mlp(self.GLOBAL_NUM, D_INTRA)
-        self.player_enc     = _mlp(self.PLAYER_NUM + 1, D_INTRA)       # + elapsed
-        self.nana_enc       = _mlp(self.NANA_NUM + 1, D_INTRA)
-        self.analog_enc     = _mlp(self.ANALOG_DIM, D_INTRA)
-        self.proj_num_enc   = _mlp(self.PROJ_NUM_PER * self.PROJ_SLOTS, D_INTRA)
-        self.btn_enc        = _mlp(self.BTN_DIM * 2, D_INTRA)
-        self.flag_enc       = _mlp(self.FLAGS_DIM * 2, D_INTRA)
-        self.nana_btn_enc   = _mlp(self.BTN_DIM * 2, D_INTRA)
-        self.nana_flag_enc  = _mlp(self.NANA_FLAGS * 2, D_INTRA)
-
-        # -------------- Intra‑frame attention block -------------------------
-        self.set_attn = _GroupAttention(d_intra=D_INTRA, nhead=4, nlayers=2, k_query=1)
-
-        # -------------- Final projection to d_model -------------------------
-        self.to_model = nn.Sequential(
+        # -----------------------------------------------------------------
+        # 3.  Projection to temporal Transformer width
+        # -----------------------------------------------------------------
+        self.out_proj = nn.Sequential(
             nn.LayerNorm(D_INTRA),
-            nn.Linear(D_INTRA, d_model),
+            nn.Linear(D_INTRA, d_model, bias=True),
             nn.GELU(),
             nn.Dropout(DROPOUT_P),
         )
 
-    # --------------------------- helper fns --------------------------------
+    # ---------------------------------------------------------------------
     @staticmethod
-    def _collapse(x: torch.Tensor) -> torch.Tensor:  # (B,T,*) -> (B*T, *)
-        B, T = x.shape[:2]
-        return x.reshape(B * T, *x.shape[2:])
+    def _collapse(x: torch.Tensor) -> torch.Tensor:
+        """(B, T, …) → (B*T, …) – handy for feeding *per‑frame* attention."""
+        b, t = x.shape[:2]
+        return x.reshape(b * t, *x.shape[2:])
 
-    # --------------------------- forward -----------------------------------
-    def forward(self, seq: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Encode a window of frames.
+    # ---------------------------------------------------------------------
+    def forward(self, seq: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Build concept tokens, pool inside each frame, project to d_model.
 
-        Parameters
-        ----------
-        seq : Mapping[str, Tensor]
-            All tensors already shaped (B, T, …).
-
-        Returns
-        -------
-        Tensor
-            (B, T, d_model) ready for the temporal Transformer.
+        Notes
+        -----
+        All tensors in *seq* already have shape (B, T, …) and floats are
+        standardised (mean 0, std 1) by the Dataset’s `collate` method.
         """
-        B, T = seq["stage"].shape  # batch, time
+        toks: List[torch.Tensor] = []
+        a = toks.append  # terse alias
 
-        # ---------------- Per‑group tokens (B,T,d_intra) -------------------
-        tok: List[torch.Tensor] = []
-        def add(x: torch.Tensor):
-            tok.append(x)
+        # ––– GAME_STATE –––
+        blz = torch.stack([
+            seq[k] for k in (
+                "blastzone_left", "blastzone_right",
+                "blastzone_top", "blastzone_bottom",
+                "stage_edge_left", "stage_edge_right",
+                "left_platform_height",  "left_platform_left",  "left_platform_right",
+                "right_platform_height", "right_platform_left", "right_platform_right",
+                "top_platform_height",   "top_platform_left",   "top_platform_right",
+            )
+        ], dim=-1)                                         # (B,T,14)
 
-        # — categorical groups —
-        add(self.stage_emb(seq["stage"]))
-        add(self.port_emb(seq["self_port"]))
-        add(self.port_emb(seq["opp_port"]))
-        add(self.char_emb(seq["self_character"]))
-        add(self.char_emb(seq["opp_character"]))
-        add(self.act_emb(seq["self_action"]))
-        add(self.act_emb(seq["opp_action"]))
-        add(self.cost_emb(seq["self_costume"]))
-        add(self.cost_emb(seq["opp_costume"]))
-        add(self.cdir_emb(seq["self_c_dir"]))
-        add(self.cdir_emb(seq["opp_c_dir"]))
-        # — nana cats —
-        add(self.char_emb(seq["self_nana_character"]))
-        add(self.char_emb(seq["opp_nana_character"]))
-        add(self.act_emb(seq["self_nana_action"]))
-        add(self.act_emb(seq["opp_nana_action"]))
-        add(self.cdir_emb(seq["self_nana_c_dir"]))
-        add(self.cdir_emb(seq["opp_nana_c_dir"]))
-        # — projectile cats —
-        for j in range(self.PROJ_SLOTS):
-            add(self.port_emb(seq[f"proj{j}_owner"]))
-            add(self.ptype_emb(seq[f"proj{j}_type"]))
-            add(self.psub_emb(seq[f"proj{j}_subtype"]))
+        a(self.tokens["GAME_STATE"](
+            cats=[seq["stage"], seq["randall_state"]],
+            floats=torch.cat([blz, seq["distance"].unsqueeze(-1)], dim=-1),
+            bools=None))
 
-        # — numeric / boolean groups —
-        add(self.glob_enc(seq["numeric"]))
-        add(self.player_enc(torch.cat([seq["self_numeric"], seq["self_action_elapsed"].unsqueeze(-1).float()], dim=-1)))
-        add(self.player_enc(torch.cat([seq["opp_numeric"], seq["opp_action_elapsed"].unsqueeze(-1).float()], dim=-1)))
-        add(self.nana_enc(torch.cat([seq["self_nana_numeric"], seq["self_nana_action_elapsed"].unsqueeze(-1).float()], dim=-1)))
-        add(self.nana_enc(torch.cat([seq["opp_nana_numeric"], seq["opp_nana_action_elapsed"].unsqueeze(-1).float()], dim=-1)))
-        add(self.analog_enc(seq["self_analog"]))
-        add(self.analog_enc(seq["opp_analog"]))
-        add(self.analog_enc(seq["self_nana_analog"]))
-        add(self.analog_enc(seq["opp_nana_analog"]))
-        add(self.proj_num_enc(torch.cat([seq[f"{k}_numeric"] for k in map(str, range(self.PROJ_SLOTS))], dim=-1)))
-        add(self.btn_enc(torch.cat([seq["self_buttons"].float(), seq["opp_buttons"].float()], dim=-1)))
-        add(self.flag_enc(torch.cat([seq["self_flags"].float(), seq["opp_flags"].float()], dim=-1)))
-        add(self.nana_btn_enc(torch.cat([seq["self_nana_buttons"].float(), seq["opp_nana_buttons"].float()], dim=-1)))
-        add(self.nana_flag_enc(torch.cat([seq["self_nana_flags"].float(), seq["opp_nana_flags"].float()], dim=-1)))
+        # ––– SELF / OPP INPUT TOKENS –––
+        a(self.tokens["SELF_INPUT"](
+            cats=[],
+            floats=seq["self_sticks"],
+            bools=seq["self_buttons"],
+        ))
+        a(self.tokens["OPP_INPUT"](
+            cats=[],
+            floats=seq["opp_sticks"],
+            bools=seq["opp_buttons"],
+        ))
 
-        # Stack along new token dim → (B,T,G,d_intra)
-        group_stack = torch.stack(tok, dim=2)      # G = len(tok)
+        # ––– SELF / OPP STATE TOKENS –––
+        a(self.tokens["SELF_STATE"](
+            cats=[seq["self_port"], seq["self_character"],
+                  seq["self_action"], seq["self_costume"], seq["self_facing"]],
+            floats=seq["self_state_floats"],
+            bools=seq["self_state_flags"],
+        ))
+        a(self.tokens["OPP_STATE"](
+            cats=[seq["opp_port"], seq["opp_character"],
+                  seq["opp_action"], seq["opp_costume"], seq["opp_facing"]],
+            floats=seq["opp_state_floats"],
+            bools=seq["opp_state_flags"],
+        ))
 
-        # Collapse (B,T) → (B*T) for per‑frame attention
-        group_flat = self._collapse(group_stack)   # (BxT, G, d_intra)
+        # ––– NANA TOKENS –––
+        a(self.tokens["NANA_SELF"](
+            cats=[seq["self_nana_character"], seq["self_nana_action"]],
+            floats=seq["self_nana_floats"],
+            bools=seq["self_nana_flags"],
+        ))
+        a(self.tokens["NANA_OPP"](
+            cats=[seq["opp_nana_character"], seq["opp_nana_action"]],
+            floats=seq["opp_nana_floats"],
+            bools=seq["opp_nana_flags"],
+        ))
 
-        # Intra‑frame attention + pooling
-        pooled_flat = self.set_attn(group_flat)    # (BxT, d_intra)
+        # ––– PROJECTILES (flatten N slots) –––
+        proj_cats: List[torch.Tensor] = []
+        proj_floats: List[torch.Tensor] = []
+        for j in range(self.proj_slots):
+            proj_cats.extend([
+                seq[f"proj{j}_type"],
+                seq[f"proj{j}_subtype"],
+                seq[f"proj{j}_owner"],
+            ])
+            proj_floats.append(seq[f"proj{j}_floats"])       # (B,T,5)
 
-        # Restore (B,T, d_intra)
-        pooled = pooled_flat.view(B, T, D_INTRA)
+        a(self.tokens["PROJECTILES"](
+            cats=proj_cats,
+            floats=torch.cat(proj_floats, dim=-1),           # (B,T,5*slots)
+            bools=None,
+        ))
 
-        # Project to model width
-        return self.to_model(pooled)               # (B, T, d_model)
+        # -----------------------------------------------------------------
+        # 2.  Stack (B,T,N,D) → pool via intra‑frame attention
+        # -----------------------------------------------------------------
+        group = torch.stack(toks, dim=2)                    # (B,T,8,256)
+        pooled = self.set_attn(self._collapse(group))       # (B*T,256)
+        pooled = pooled.view(group.size(0), group.size(1), D_INTRA)
+
+        # -----------------------------------------------------------------
+        # 3.  Project to temporal Transformer width
+        # -----------------------------------------------------------------
+        return self.out_proj(pooled)                        # (B,T,d_model)
