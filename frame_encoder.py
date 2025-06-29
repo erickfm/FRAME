@@ -185,16 +185,7 @@ class FrameEncoder(nn.Module):
         a = toks.append
 
         #── GAME_STATE ──────────────────────────────────────────────────
-        geom = torch.stack([
-            seq[k] for k in (
-                "blastzone_left",  "blastzone_right",
-                "blastzone_top",   "blastzone_bottom",
-                "stage_edge_left", "stage_edge_right",
-                "left_platform_height",  "left_platform_left",  "left_platform_right",
-                "right_platform_height", "right_platform_left", "right_platform_right",
-                "top_platform_height",   "top_platform_left",   "top_platform_right",
-            )
-        ], dim=-1)                                     # (B,T,14)
+        geom = seq["stage_geom"]                        # (B,T,15)
 
         extras = torch.stack([
             seq["randall_height"],
