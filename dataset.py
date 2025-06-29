@@ -79,7 +79,7 @@ def encode_cstick_dir(
     dead_zone: float = 0.15,
 ) -> str:
     dx = df[f"{prefix}_c_x"].astype("float32") - 0.5
-    dy = 0.5 - df[f"{prefix}_c_y"].astype("float32")   # invert so up = +Y
+    dy = df[f"{prefix}_c_y"].astype("float32") - 0.5
 
     mag   = np.hypot(dx, dy)
     cat   = np.zeros_like(mag, dtype="int64")
