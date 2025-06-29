@@ -178,7 +178,7 @@ class FrameEncoder(nn.Module):
         def add(x: torch.Tensor):
             tok.append(x)
 
-        # — categorical groups —
+        # — categorical groups —
         add(self.stage_emb(seq["stage"]))
         add(self.port_emb(seq["self_port"]))
         add(self.port_emb(seq["opp_port"]))
