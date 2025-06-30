@@ -187,17 +187,31 @@ class MeleeFrameDataset(Dataset):
     # -----------------------------------------------------------------
     def _tensor(self, df: pd.DataFrame, spec: TensorSpec) -> torch.Tensor:
         T = len(df)
-        if spec.shape == ():              # scalar
+
+        # ------------ build NumPy array ------------
+        if spec.shape == ():                         # scalar
             col = spec.cols[0]
             arr = df[col].to_numpy(spec.dtype) if col in df else np.zeros(T, spec.dtype)
-        else:                             # vector
+        else:                                        # vector
             C = spec.shape[0]
             arr = np.zeros((T, C), spec.dtype)
             for i, col in enumerate(spec.cols):
                 if col in df:
                     arr[:, i] = df[col].astype(spec.dtype).to_numpy()
+
+        # cast bool-vectors to float
         if spec.dtype == "bool":
             arr = arr.astype("float32")
+
+        # ------------ FINAL SAFETY NET ------------
+        # zero-out any NaN / +Inf / -Inf that might have slipped through
+        if arr.dtype.kind in ("f", "i"):         # numeric dtypes only
+            bad = ~np.isfinite(arr)
+            if bad.any():
+                if self.debug:
+                    print(f"⚠️ non-finite in {spec.token}/{spec.cols[0]} – patched")
+                arr[bad] = 0.0
+
         return torch.from_numpy(arr)
 
     # -----------------------------------------------------------------
