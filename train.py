@@ -103,6 +103,7 @@ def get_dataset():
         parquet_dir=DATA_DIR,
         seq_len=SEQUENCE_LENGTH,
         delay=REACTION_DELAY,
+        debug=True,
     )
 
 def get_dataloader(ds):
