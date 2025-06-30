@@ -251,7 +251,7 @@ class MeleeFrameDataset(Dataset):
                 col = spec.cols[0]
                 if col in df:
                     mp = self._enum(col)
-                    df[col] = df[col].astype("int64").map(mp.get)
+                    df[col] = df[col].map(lambda v: mp.get(int(v), 0)).astype("int64")
 
         # slice window & target -------------------------------------------
         win  = df.iloc[start:start + self.W].reset_index(drop=True)
