@@ -207,10 +207,9 @@ class MeleeFrameDataset(Dataset):
         # zero-out any NaN / +Inf / -Inf that might have slipped through
         if arr.dtype.kind in ("f", "i"):         # numeric dtypes only
             bad = ~np.isfinite(arr)
-            if bad.any():
-                if self.debug:
-                    print(f"⚠️ non-finite in {spec.token}/{spec.cols[0]} – patched")
-                arr[bad] = 0.0
+            if bad.any() and self.debug:
+                bad_cols = [c for c, col_mask in zip(spec.cols, bad.T) if col_mask.any()]
+                print(f"🟠 non-finite in {spec.token}: {bad_cols} – patched")
 
         return torch.from_numpy(arr)
 
