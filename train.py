@@ -25,7 +25,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE      = 256
 NUM_EPOCHS      = 200
-LEARNING_RATE   = 2e-4
+LEARNING_RATE   = 1e-4
 WEIGHT_DECAY    = 1e-2            # AdamW (weights only)
 NUM_WORKERS     = 16
 SEQUENCE_LENGTH = 60
@@ -134,12 +134,15 @@ DEBUG = args.debug or bool(os.getenv("DEBUG", ""))
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Training loop with sanity checks, GradNorm, AMP, checkpointing
 # ─────────────────────────────────────────────────────────────────────────────
+# --- constants for GradNorm clamping -----------------------------------------
+CDIR_IDX   = TASK_NAMES.index("cdir")  # make sure this matches your TASK_NAMES
+MIN_W_CDIR = 0.7
+
 def train():
     torch.autograd.set_detect_anomaly(True)
 
-    ds        = get_dataset()
-    dl        = get_dataloader(ds)
-    model, cfg = get_model()
+    ds, dl       = get_dataset(), get_dataloader(get_dataset())
+    model, cfg   = get_model()
 
     # —— GradNorm learnable weights ——————————————————————————————
     loss_weights = torch.nn.Parameter(torch.ones(len(TASK_NAMES), device=DEVICE))
@@ -153,18 +156,20 @@ def train():
                   else decay).append(p)
 
     optimiser = optim.AdamW(
-        [{"params": decay,      "weight_decay": WEIGHT_DECAY},
-         {"params": no_decay,   "weight_decay": 0.0},
-         {"params": [loss_weights], "weight_decay": 0.0}],
+        [
+            {"params": decay,      "weight_decay": WEIGHT_DECAY},
+            {"params": no_decay,   "weight_decay": 0.0},
+            {"params": [loss_weights], "weight_decay": 0.0},
+        ],
         lr=LEARNING_RATE,
         betas=(0.9, 0.999),
     )
 
-    scaler = GradScaler(enabled=USE_AMP)  # fp16 scaler
+    scaler = GradScaler(enabled=USE_AMP)
 
     # —— optional resume ————————————————————————————————————————
-    start_epoch     = 1
-    init_task_loss  = None
+    start_epoch    = 1
+    init_task_loss = None
     if args.resume:
         ckpt = torch.load(args.resume, map_location=DEVICE)
         model.load_state_dict(ckpt['model_state_dict'])
@@ -176,21 +181,13 @@ def train():
         if USE_AMP and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch = ckpt['epoch'] + 1
-        print(f"Resumed from {args.resume}, starting at epoch {start_epoch}")
 
     wandb.init(
-        project="FRAME",
-        entity="erickfm",
-        config=dict(
-            batch_size=BATCH_SIZE,
-            learning_rate=LEARNING_RATE,
-            epochs=NUM_EPOCHS,
-            num_workers=NUM_WORKERS,
-            sequence_length=SEQUENCE_LENGTH,
-            reaction_delay=REACTION_DELAY,
-            amp=USE_AMP,
-            **cfg.__dict__,
-        ),
+        project="FRAME", entity="erickfm",
+        config=dict(batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE,
+                    epochs=NUM_EPOCHS, num_workers=NUM_WORKERS,
+                    sequence_length=SEQUENCE_LENGTH, reaction_delay=REACTION_DELAY,
+                    amp=USE_AMP, **cfg.__dict__),
     )
 
     global_step = 0
@@ -200,56 +197,45 @@ def train():
         print(f"\n=== Epoch {epoch}/{NUM_EPOCHS} ===")
 
         for i, (state, target) in enumerate(dl, 1):
-            # —— move to device & sanity-check inputs ——————————————
-            for k, v in state.items():
-                state[k] = v.to(DEVICE, non_blocking=True)
-                if DEBUG and not torch.isfinite(state[k]).all():
-                    raise RuntimeError(f"Non-finite in state['{k}']")
-            for k, v in target.items():
-                target[k] = v.to(DEVICE, non_blocking=True)
-                if DEBUG and not torch.isfinite(target[k]).all():
-                    raise RuntimeError(f"Non-finite in target['{k}']")
+            # move to device & sanity-check
+            for k, v in {**state, **target}.items():
+                v = v.to(DEVICE, non_blocking=True)
+                if DEBUG and not torch.isfinite(v).all():
+                    raise RuntimeError(f"Non-finite tensor in {k}")
+                if k in state: state[k] = v
+                else:         target[k] = v
 
-            # —— forward (fp16 autocast) ——————————————————————————
+            # forward
             with autocast("cuda", enabled=USE_AMP):
                 preds = model(state)
 
-            if DEBUG:
-                for name, t in preds.items():
-                    if not torch.isfinite(t).all():
-                        raise RuntimeError(f"Non-finite in output '{name}'")
-
-            # —— losses & GradNorm weighting ——————————————————————
+            # compute losses + GradNorm
             metrics, task_losses = compute_loss(preds, target)
             loss_vec = torch.stack(task_losses)
             if init_task_loss is None:
                 init_task_loss = loss_vec.detach()
 
-            weighted   = loss_weights * loss_vec
-            task_loss  = weighted.sum()
+            weighted = loss_weights * loss_vec
+            task_loss = weighted.sum()
 
-            avg_loss   = loss_vec.mean().detach()
-            inv_rate   = (loss_vec / init_task_loss).detach()
-            target_g   = avg_loss * inv_rate.pow(GRADNORM_ALPHA)
-            gradnorm   = nn.functional.l1_loss(loss_vec, target_g)
+            avg_loss = loss_vec.mean().detach()
+            inv_rate = (loss_vec / init_task_loss).detach()
+            target_g = avg_loss * inv_rate.pow(GRADNORM_ALPHA)
+            gradnorm = nn.functional.l1_loss(loss_vec, target_g)
 
             total_loss = task_loss + gradnorm
 
-            # —— first-batch grad stats (unchanged) ————————————————
+            # optional debug grads on first batch
             if i == 1 and epoch == start_epoch:
-                grads = torch.autograd.grad(total_loss,
-                                            model.parameters(),
-                                            retain_graph=True)
-                print("=== GRADIENT STATS FOR FIRST BATCH ===")
-                for (pname, p), g in zip(model.named_parameters(), grads):
+                grads = torch.autograd.grad(total_loss, model.parameters(), retain_graph=True)
+                print("=== FIRST-BATCH GRADS ===")
+                for (n, p), g in zip(model.named_parameters(), grads):
                     if g is None:
-                        print(f"{pname:40s} | no grad")
+                        print(f"{n:40s} | no grad")
                     else:
-                        print(f"{pname:40s} | norm={g.norm().item():8.3f}"
-                              f"  nan={int(torch.isnan(g).sum())}"
-                              f"  inf={int(torch.isinf(g).sum())}")
+                        print(f"{n:40s} | norm={g.norm():.3f}")
 
-            # —— backward / step with scaler ————————————————
+            # backward + step
             optimiser.zero_grad(set_to_none=True)
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimiser)
@@ -257,31 +243,36 @@ def train():
             scaler.step(optimiser)
             scaler.update()
 
-            loss_weights.data.clamp_(min=0.0)
+            # —— clamp cdir weight floor ——————————————————————
+            with torch.no_grad():
+                # keep all weights ≥ 0
+                loss_weights.data.clamp_(min=0.0)
+                # but force cdir ≥ MIN_W_CDIR
+                loss_weights.data[CDIR_IDX].clamp_(min=MIN_W_CDIR)
 
-            # —— logging ——————————————————————————————————————
+            # logging
             global_step += 1
             wandb.log(
-                dict(step=global_step,
-                     total=total_loss.item(),
-                     gradnorm=gradnorm.item(),
-                     **metrics,
-                     **{f"w_{n}": loss_weights[j].item()
-                        for j, n in enumerate(TASK_NAMES)}),
+                {
+                    "step": global_step,
+                    "total": total_loss.item(),
+                    "gradnorm": gradnorm.item(),
+                    **metrics,
+                    **{f"w_{n}": loss_weights[j].item() for j, n in enumerate(TASK_NAMES)}
+                },
                 step=global_step,
             )
+
             epoch_loss += total_loss.item()
             batch_ct   += 1
-
             if i % 25 == 0:
                 print(
-                    f"[{i:04d}] total={total_loss.item():.4f} "
-                    f"main={metrics['loss_main']:.3f} l={metrics['loss_l']:.3f} "
-                    f"r={metrics['loss_r']:.3f} cdir={metrics['loss_cdir']:.3f} "
-                    f"btn={metrics['loss_btn']:.3f} gn={gradnorm.item():.3f}"
+                    f"[{i:04d}] total={total_loss:.4f} "
+                    f"main={metrics['loss_main']:.3f} "
+                    f"cdir={metrics['loss_cdir']:.3f} gn={gradnorm:.3f}"
                 )
 
-        # —— checkpoint & report ——————————————————————————————
+        # end epoch checkpoint
         avg = epoch_loss / max(batch_ct, 1)
         print(f"Epoch {epoch} done. Avg loss={avg:.4f}")
         os.makedirs("checkpoints", exist_ok=True)
@@ -296,9 +287,10 @@ def train():
             "config":               cfg.__dict__,
         }, ckpt_path)
         print("Saved checkpoint →", ckpt_path)
-        wandb.log(dict(epoch=epoch, avg_loss=avg), step=global_step)
+        wandb.log({"epoch": epoch, "avg_loss": avg}, step=global_step)
 
     wandb.finish()
+
 
 if __name__ == "__main__":
     train()
