@@ -128,8 +128,11 @@ parser = argparse.ArgumentParser(description="Realtime FRAME bot w/ debug")
 parser.add_argument("--debug",  action="store_true", help="Verbose sanity checks")
 parser.add_argument("--resume", type=str, default=None,
                     help="Path to checkpoint (.pt) to resume from")
+parser.add_argument("--no-gradnorm", action="store_true",
+                    help="Disable GradNorm loss balancing")
 args  = parser.parse_args()
 DEBUG = args.debug or bool(os.getenv("DEBUG", ""))
+USE_GRADNORM = not args.no_gradnorm
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Training loop with sanity checks, GradNorm, AMP, checkpointing
@@ -146,6 +149,8 @@ def train():
 
     # —— GradNorm learnable weights ——————————————————————————————
     loss_weights = torch.nn.Parameter(torch.ones(len(TASK_NAMES), device=DEVICE))
+    if not USE_GRADNORM:
+        loss_weights.requires_grad_(False)
 
     # —— AdamW param-groups (bias/Norm excluded from decay) ————————
     decay, no_decay = [], []
@@ -155,15 +160,13 @@ def train():
         (no_decay if n.endswith("bias") or "norm" in n.lower()
                   else decay).append(p)
 
-    optimiser = optim.AdamW(
-        [
-            {"params": decay,      "weight_decay": WEIGHT_DECAY},
-            {"params": no_decay,   "weight_decay": 0.0},
-            {"params": [loss_weights], "weight_decay": 0.0},
-        ],
-        lr=LEARNING_RATE,
-        betas=(0.9, 0.999),
-    )
+    optim_groups = [
+        {"params": decay,    "weight_decay": WEIGHT_DECAY},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    if USE_GRADNORM:
+        optim_groups.append({"params": [loss_weights], "weight_decay": 0.0})
+    optimiser = optim.AdamW(optim_groups, lr=LEARNING_RATE, betas=(0.9, 0.999))
 
     scaler = GradScaler(enabled=USE_AMP)
 
@@ -174,9 +177,10 @@ def train():
         ckpt = torch.load(args.resume, map_location=DEVICE)
         model.load_state_dict(ckpt['model_state_dict'])
         optimiser.load_state_dict(ckpt['optimizer_state_dict'])
-        loss_weights.data.copy_(ckpt['loss_weights'])
+        if USE_GRADNORM and 'loss_weights' in ckpt:
+            loss_weights.data.copy_(ckpt['loss_weights'])
         init_task_loss = ckpt.get("init_task_loss")
-        if init_task_loss is not None:
+        if USE_GRADNORM and init_task_loss is not None:
             init_task_loss = init_task_loss.to(DEVICE)
         if USE_AMP and ckpt.get("scaler_state_dict"):
             scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -212,18 +216,24 @@ def train():
             # compute losses + GradNorm
             metrics, task_losses = compute_loss(preds, target)
             loss_vec = torch.stack(task_losses)
-            if init_task_loss is None:
-                init_task_loss = loss_vec.detach()
 
-            weighted = loss_weights * loss_vec
-            task_loss = weighted.sum()
+            if USE_GRADNORM:
+                if init_task_loss is None:
+                    init_task_loss = loss_vec.detach()
 
-            avg_loss = loss_vec.mean().detach()
-            inv_rate = (loss_vec / init_task_loss).detach()
-            target_g = avg_loss * inv_rate.pow(GRADNORM_ALPHA)
-            gradnorm = nn.functional.l1_loss(loss_vec, target_g)
+                weighted = loss_weights * loss_vec
+                task_loss = weighted.sum()
 
-            total_loss = task_loss + gradnorm
+                avg_loss = loss_vec.mean().detach()
+                inv_rate = (loss_vec / init_task_loss).detach()
+                target_g = avg_loss * inv_rate.pow(GRADNORM_ALPHA)
+                gradnorm = nn.functional.l1_loss(loss_vec, target_g)
+
+                total_loss = task_loss + gradnorm
+            else:
+                task_loss = loss_vec.sum()
+                gradnorm = torch.tensor(0.0, device=DEVICE)
+                total_loss = task_loss
 
             # optional debug grads on first batch
             if i == 1 and epoch == start_epoch:
@@ -244,24 +254,24 @@ def train():
             scaler.update()
 
             # —— clamp cdir weight floor ——————————————————————
-            with torch.no_grad():
-                # keep all weights ≥ 0
-                loss_weights.data.clamp_(min=0.0)
-                # but force cdir ≥ MIN_W_CDIR
-                loss_weights.data[CDIR_IDX].clamp_(min=MIN_W_CDIR)
+            if USE_GRADNORM:
+                with torch.no_grad():
+                    # keep all weights ≥ 0
+                    loss_weights.data.clamp_(min=0.0)
+                    # but force cdir ≥ MIN_W_CDIR
+                    loss_weights.data[CDIR_IDX].clamp_(min=MIN_W_CDIR)
 
             # logging
             global_step += 1
-            wandb.log(
-                {
-                    "step": global_step,
-                    "total": total_loss.item(),
-                    "gradnorm": gradnorm.item(),
-                    **metrics,
-                    **{f"w_{n}": loss_weights[j].item() for j, n in enumerate(TASK_NAMES)}
-                },
-                step=global_step,
-            )
+            log_data = {
+                "step": global_step,
+                "total": total_loss.item(),
+                "gradnorm": gradnorm.item(),
+                **metrics,
+            }
+            if USE_GRADNORM:
+                log_data.update({f"w_{n}": loss_weights[j].item() for j, n in enumerate(TASK_NAMES)})
+            wandb.log(log_data, step=global_step)
 
             epoch_loss += total_loss.item()
             batch_ct   += 1
@@ -282,7 +292,7 @@ def train():
             "model_state_dict":     model.state_dict(),
             "optimizer_state_dict": optimiser.state_dict(),
             "loss_weights":         loss_weights.data.cpu(),
-            "init_task_loss":       init_task_loss.cpu(),
+            "init_task_loss":       init_task_loss.cpu() if init_task_loss is not None else None,
             "scaler_state_dict":    scaler.state_dict(),
             "config":               cfg.__dict__,
         }, ckpt_path)
