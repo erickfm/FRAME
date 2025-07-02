@@ -39,7 +39,11 @@ torch.set_printoptions(sci_mode=False, precision=4)
 # ── maps & model ─────────────────────────────────────────────────────────────
 from cat_maps import STAGE_MAP, CHARACTER_MAP, ACTION_MAP, PROJECTILE_TYPE_MAP
 from model     import FramePredictor, ModelConfig
-from dataset   import MeleeFrameDatasetWithDelay  # only for feature spec
+from dataset   import (
+    MeleeFrameDataset,
+    TOKEN_SPEC,
+    encode_cstick_dir,
+)
 
 # ════════════════════════════════════════════════════════════════════════════
 # 0)  Device + checkpoint
@@ -65,19 +69,19 @@ MAX_PROJ = 8
 # ════════════════════════════════════════════════════════════════════════════
 # 1)  Feature spec from Dataset
 # ════════════════════════════════════════════════════════════════════════════
-_spec = MeleeFrameDatasetWithDelay.__new__(MeleeFrameDatasetWithDelay)
-_spec.feature_groups = _spec._build_feature_groups()
-_spec._categorical_cols = [
-    col for _, meta in _spec._walk_groups(return_meta=True)
-    if meta["ftype"] == "categorical" for col in meta["cols"]
-]
-_spec._enum_maps = {
-    "stage":      STAGE_MAP,
+_spec = MeleeFrameDataset.__new__(MeleeFrameDataset)
+_spec.enums = {
+    "stage": STAGE_MAP,
     "_character": CHARACTER_MAP,
-    "_action":    ACTION_MAP,
-    "_type":      PROJECTILE_TYPE_MAP,
-    "c_dir":      {i: i for i in range(5)},  # identity map
+    "_action": ACTION_MAP,
+    "_type": PROJECTILE_TYPE_MAP,
+    "_subtype": {i: i for i in range(42)},
+    "_c_dir": {i: i for i in range(5)},
+    "_port": {i: i for i in range(4)},
+    "_owner": {i: i for i in range(4)},
+    "_costume": {i: i for i in range(8)},
 }
+_categorical_cols = [col for name, spec in TOKEN_SPEC.items() if spec.dtype == "int64" for col in spec.cols]
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2)  Debug helpers
@@ -99,35 +103,29 @@ def check_tensor_dict(tdict: Dict[str, torch.Tensor], where: str) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 # 3)  dataframe utils
 # ════════════════════════════════════════════════════════════════════════════
-def encode_cstick_dir_df(df: pd.DataFrame, prefix: str, dead: float = 0.15):
-    dx = df[f"{prefix}_c_x"].astype(np.float32) - 0.5
-    dy = 0.5 - df[f"{prefix}_c_y"].astype(np.float32)      # up = +Y
-    mag = np.hypot(dx, dy)
-
-    cat = np.zeros_like(mag, dtype=np.int64)
-    active = mag > dead
-    horiz  = active & (np.abs(dx) >= np.abs(dy))
-    vert   = active & (np.abs(dy) >  np.abs(dx))
-
-    cat[horiz & (dx > 0)] = 4
-    cat[horiz & (dx < 0)] = 3
-    cat[vert  & (dy > 0)] = 1
-    cat[vert  & (dy < 0)] = 2
-    df[f"{prefix}_c_dir"] = cat
+def encode_cstick_dir_df(df: pd.DataFrame, prefix: str, dead: float = 0.15) -> None:
+    """Wrapper using dataset.encode_cstick_dir for live frames."""
+    if f"{prefix}_c_x" in df.columns and f"{prefix}_c_y" in df.columns:
+        encode_cstick_dir(df, prefix, dead)
 
 
 def _map_cat(col: str, x: Any) -> int:
-    if col == "stage":
-        return _spec._enum_maps["stage"].get(x, 0)
-    if col.endswith("_c_dir"):
-        return int(x) if 0 <= int(x) <= 4 else 0
-    for suf, mp in _spec._enum_maps.items():
-        if suf != "stage" and col.endswith(suf):
-            return mp.get(x, 0)
+    """Map raw enum value or name to dataset index."""
+    m = _spec._enum(col)
     try:
-        return max(int(x), 0)
+        if isinstance(x, str) and x:
+            if col == "stage":
+                x = melee.enums.Stage[x].value
+            elif col.endswith("_character"):
+                x = melee.enums.Character[x].value
+            elif col.endswith("_action"):
+                x = melee.enums.Action[x].value
+            elif col.endswith("_type"):
+                x = melee.enums.ProjectileType[x].value
+        x = int(x)
     except Exception:
-        return 0
+        x = 0
+    return m.get(x, 0)
 
 
 def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -136,8 +134,25 @@ def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
     # ---------- C-stick dirs ----------
     for p in ("self", "opp", "self_nana", "opp_nana"):
-        if f"{p}_c_x" in df.columns:
-            encode_cstick_dir_df(df, p)
+        encode_cstick_dir_df(df, p)
+
+    # ---------- Derived fields ----------
+    if "self_pos_x" in df.columns and "opp_pos_x" in df.columns:
+        df["distance"] = np.hypot(
+            df["self_pos_x"] - df["opp_pos_x"],
+            df["self_pos_y"] - df["opp_pos_y"],
+        ).astype("float32")
+    df["self_nana_present"] = (df.get("self_nana_character", 0) > 0).astype("float32")
+    df["opp_nana_present"]  = (df.get("opp_nana_character", 0) > 0).astype("float32")
+
+    for col in [
+        "self_facing",
+        "opp_facing",
+        "self_nana_facing",
+        "opp_nana_facing",
+    ]:
+        if col in df.columns:
+            df[col] = (df[col] > 0).astype("float32")
 
     # ---------- Fill NaNs ----------
     num_cols  = [c for c, t in df.dtypes.items() if t.kind in ("i", "f")]
@@ -146,28 +161,23 @@ def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     df[bool_cols] = df[bool_cols].fillna(False)
 
     # ---------- Ensure categorical columns ----------
-    missing_cats = [c for c in _spec._categorical_cols if c not in df.columns]
+    missing_cats = [c for c in _categorical_cols if c not in df.columns]
     if missing_cats:
-        df = pd.concat([df, pd.DataFrame({c: 0 for c in missing_cats},
-                                         index=df.index)], axis=1)
+        df = pd.concat(
+            [df, pd.DataFrame({c: 0 for c in missing_cats}, index=df.index)],
+            axis=1,
+        )
 
     # ---------- Map categoricals ----------
-    for col in _spec._categorical_cols:
+    for col in _categorical_cols:
         df[col] = df[col].map(lambda x, c=col: _map_cat(c, x)).astype("int64")
 
-    # ---------- Synthetic Nana flags ----------
-    df["self_nana_present"] = (df.get("self_nana_character", 0) > 0).astype("float32")
-    df["opp_nana_present"]  = (df.get("opp_nana_character", 0) > 0).astype("float32")
-
     # ---------- Ensure numeric columns ----------
-    numeric_missing = {}
-    for _, meta in _spec._walk_groups(return_meta=True):
-        if meta["ftype"] != "categorical":
-            for col in meta["cols"]:
+    for name, spec in TOKEN_SPEC.items():
+        if spec.dtype != "int64":
+            for col in spec.cols:
                 if col not in df.columns:
-                    numeric_missing[col] = 0.0
-    if numeric_missing:
-        df = pd.concat([df, pd.DataFrame(numeric_missing, index=df.index)], axis=1)
+                    df[col] = 0.0
 
     # Optional dataframe NaN audit
     if DEBUG and df.isna().any().any():
@@ -175,17 +185,10 @@ def rows_to_state_seq(rows: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         log.warning("DataFrame still has NaNs in cols: %s", bad)
 
     # ---------- Build tensor dict ----------
-    state_seq: Dict[str, torch.Tensor] = {}
-    for _, meta in _spec._walk_groups(return_meta=True):
-        cols, ftype, entity = meta["cols"], meta["ftype"], meta["entity"]
-        key = f"{entity}_{ftype}" if entity != "global" else ftype
-
-        if ftype == "categorical":
-            for col in cols:
-                state_seq[col] = torch.from_numpy(df[col].values).long().unsqueeze(0)
-        else:
-            mats = [torch.from_numpy(df[c].astype(np.float32).values) for c in cols]
-            state_seq[key] = (torch.stack(mats, -1) if len(mats) > 1 else mats[0]).unsqueeze(0)
+    state_seq: Dict[str, torch.Tensor] = {
+        name: _spec._tensor(df, spec).unsqueeze(0)
+        for name, spec in TOKEN_SPEC.items()
+    }
 
     if DEBUG:
         check_tensor_dict(state_seq, "state_seq")
