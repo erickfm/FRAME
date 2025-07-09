@@ -24,11 +24,11 @@ from model   import FramePredictor, ModelConfig
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE      = 256
-NUM_EPOCHS      = 200
+NUM_EPOCHS      = 100
 LEARNING_RATE   = 1e-4
 WEIGHT_DECAY    = 1e-2            # AdamW (weights only)
 NUM_WORKERS     = 16
-SEQUENCE_LENGTH = 60
+SEQUENCE_LENGTH = 180
 REACTION_DELAY  = 1
 DATA_DIR        = "./data"
 
