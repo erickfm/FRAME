@@ -116,7 +116,7 @@ class PredictionHeads(nn.Module):
                 layers.append(activation)
             return nn.Sequential(*layers)
 
-        self.main_head  = build(2, nn.Tanh())
+        self.main_head  = build(2, nn.Sigmoid())  # data is [0,1] not [-1,1]
         self.L_head     = build(1, nn.Sigmoid())
         self.R_head     = build(1, nn.Sigmoid())
         self.cdir_head  = build(5)                # raw logits

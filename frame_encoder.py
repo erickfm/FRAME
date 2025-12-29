@@ -18,7 +18,7 @@ import torch.nn as nn
 # -----------------------------------------------------------------------------
 # Hyper‑params / helpers
 # -----------------------------------------------------------------------------
-DROPOUT_P = 0.10          # global dropout applied everywhere
+DROPOUT_P = 0.0           # turn off for overfitting tests (was 0.10)
 D_INTRA   = 256           # width for intra‑frame tokens
 
 

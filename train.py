@@ -10,8 +10,9 @@ import torch.optim as optim
 import torch.nn.utils as nn_utils
 from torch.utils.data import DataLoader
 
-# —— AMP (new namespace in ≥2.3) ————————————————————————————————
-from torch.amp import autocast, GradScaler
+# —— AMP ————————————————————————————————————————————————————————
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 
 import wandb
 
@@ -109,7 +110,7 @@ def get_dataloader(ds):
     return DataLoader(
         ds,
         batch_size=BATCH_SIZE,
-        shuffle=False,
+        shuffle=True,
         num_workers=NUM_WORKERS,
         collate_fn=collate_fn,
         drop_last=True,
